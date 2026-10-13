@@ -140,6 +140,8 @@ later (see COPYING). It contains:
   - the SANE genesys backend (GL841 / LiDE 50), GPL-2.0-or-later
   - libusb 1.0.27, LGPL-2.1-or-later
   - miniz (MIT) and stb_image_write (public domain)
-The complete source code is in LiDE50Scan-source.zip.
+The complete source code is in LiDE50Scan-source.zip and at
+https://github.com/ifloofie/LiDE50-scanner (credits with links to each
+project are on that page).
 Canon and CanoScan are trademarks of Canon Inc. This app is not affiliated
 with or endorsed by Canon.

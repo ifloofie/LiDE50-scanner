@@ -8,20 +8,6 @@
 *.exe
 *.map
 
-# libusb configure/build artifacts
-/third_party/libusb-1.0.27/autom4te.cache/
-/third_party/libusb-1.0.27/config.h
-/third_party/libusb-1.0.27/config.log
-/third_party/libusb-1.0.27/config.status
-/third_party/libusb-1.0.27/libtool
-/third_party/libusb-1.0.27/libusb-1.0.pc
-/third_party/libusb-1.0.27/stamp-h1
-/third_party/libusb-1.0.27/**/Makefile
-/third_party/libusb-1.0.27/**/.deps/
-/third_party/libusb-1.0.27/**/.libs/
-/third_party/libusb-1.0.27/**/*.lo
-/third_party/libusb-1.0.27/**/*.la
-
 # runtime files the app creates next to the exe
 LiDE50Scan-data/
 LiDE50Scan.log

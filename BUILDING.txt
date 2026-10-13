@@ -1,8 +1,9 @@
 Building LiDE50 Scan (cross-compiled on Ubuntu 24.04 with MinGW-w64)
 
   apt install g++-mingw-w64-x86-64-posix gcc-mingw-w64-x86-64-posix autoconf automake libtool
-  # libusb 1.0.27 (source included in third_party/libusb-1.0.27)
-  cd third_party/libusb-1.0.27 && ./bootstrap.sh && \
+  git clone --recursive https://github.com/ifloofie/LiDE50-scanner.git && cd LiDE50-scanner
+  # libusb 1.0.27 is a git submodule in third_party/libusb (official repository, tag v1.0.27)
+  cd third_party/libusb && ./bootstrap.sh && \
     ./configure --host=x86_64-w64-mingw32 --enable-static --disable-shared --prefix=$PWD/../../deps && \
     make && make install && cd ../..
   make core app          # -> dist/LiDE50Scan.exe
@@ -13,7 +14,8 @@ Layout
   core/shim      Windows replacements for sanei_usb (libusb/WinUSB), config and debug
   app/           Win32 user interface, scanner engine thread, image adjustments,
                  PDF/DOCX/PNG/JPEG/TIFF/BMP writers, one-time WinUSB binding
-  third_party    miniz (MIT), stb_image_write (public domain), libusb (LGPL)
+  third_party    miniz 3.0.2 (MIT), stb_image_write v1.16 (public domain),
+                 libusb/ = submodule of github.com/libusb/libusb at v1.0.27 (LGPL)
 
 Run "LiDE50Scan.exe --simulate" to exercise the complete driver code path against
 the backend's virtual LiDE 50 (no hardware needed), and "--log" for a USB trace.

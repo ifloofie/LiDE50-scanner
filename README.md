@@ -51,8 +51,13 @@ LiDE50 Scan is cross-compiled from Linux with MinGW-w64. On Ubuntu 24.04:
 ```sh
 sudo apt install g++-mingw-w64-x86-64-posix gcc-mingw-w64-x86-64-posix autoconf automake libtool
 
-# static libusb (source included)
-cd third_party/libusb-1.0.27
+# clone with --recursive: libusb is a submodule linked to the official repository
+git clone --recursive https://github.com/ifloofie/LiDE50-scanner.git
+cd LiDE50-scanner
+# (already cloned without --recursive? run: git submodule update --init)
+
+# static libusb
+cd third_party/libusb
 ./bootstrap.sh
 ./configure --host=x86_64-w64-mingw32 --enable-static --disable-shared --prefix=$PWD/../../deps
 make && make install
@@ -63,6 +68,10 @@ make core app        # produces dist/LiDE50Scan.exe
 
 The result is a single statically linked exe. It depends only on DLLs that ship with
 Windows. See [BUILDING.txt](BUILDING.txt) for the source layout.
+
+GitHub's **Download ZIP** button leaves out submodules, so it won't include libusb. To
+build, use `git clone --recursive`, or use the complete source archive
+(`LiDE50Scan-source.zip`) inside each [release](../../releases) download.
 
 ### Testing without a scanner
 
@@ -79,19 +88,31 @@ Windows. See [BUILDING.txt](BUILDING.txt) for the source layout.
 | `app/ui/` | Drawing layer and glass widget toolkit |
 | `core/genesys/` | SANE 1.2.1 genesys backend, reduced to the GL841 / Canon LiDE 50 |
 | `core/shim/` | Windows replacements for SANE's USB, configuration and debug helpers (libusb/WinUSB) |
-| `third_party/` | libusb 1.0.27, miniz, stb_image_write |
+| `third_party/libusb/` | libusb 1.0.27 (submodule linked to the official repository) |
+| `third_party/` | miniz and stb_image_write |
+
+## Credits
+
+LiDE50 Scan is built on these open-source projects:
+
+| Project | Version | Used for | License |
+|---|---|---|---|
+| [SANE backends](https://gitlab.com/sane-project/backends) ([sane-project.org](http://www.sane-project.org/)) | [1.2.1](https://gitlab.com/sane-project/backends/-/tree/1.2.1/backend/genesys) | The scanner driver: the `genesys` backend's GL841 / Canon LiDE 50 support. **Modified:** reduced to this one scanner and adapted to Windows (see `core/`). | GPL-2.0-or-later |
+| [libusb](https://github.com/libusb/libusb) | [v1.0.27](https://github.com/libusb/libusb/releases/tag/v1.0.27) | USB communication with the scanner through Windows' WinUSB driver. Included unmodified as a submodule. | LGPL-2.1-or-later |
+| [miniz](https://github.com/richgel999/miniz) | [3.0.2](https://github.com/richgel999/miniz/releases/tag/3.0.2) | Compression for PNG, PDF and Word (.docx) files. Single-file amalgamated build, unmodified. | MIT |
+| [stb](https://github.com/nothings/stb) | [stb_image_write v1.16](https://github.com/nothings/stb/blob/master/stb_image_write.h) | JPEG and BMP encoding. Unmodified. | Public domain / MIT |
+
+Background:
+
+- [Canon's original LiDE 50 driver](https://sg.canon/en/support/0900313105) (version 7.1.3.3a) is
+  32-bit only for Windows XP/Vista/2000 and can't load on 64-bit Windows. That's why this
+  project exists. None of Canon's code is used.
 
 ## License
 
 LiDE50 Scan is free software under the **GNU General Public License v2 or later**
-(see [COPYING](COPYING)), because it contains code from the SANE genesys backend.
-
-Included third-party code:
-
-- SANE genesys backend: GPL-2.0-or-later
-- libusb 1.0.27: LGPL-2.1-or-later
-- miniz: MIT
-- stb_image_write: public domain / MIT
+(see [COPYING](COPYING)), because it contains code from the SANE genesys backend. The
+third-party components keep their own licenses, listed under [Credits](#credits).
 
 Canon and CanoScan are trademarks of Canon Inc. This project is not affiliated with or
 endorsed by Canon.
