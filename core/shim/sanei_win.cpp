@@ -126,14 +126,33 @@ struct FakeGl841 {
         }
     }
 
+    // INVESTIGATION: register snapshot at every scan/move start
+    void snapshot(const char* what)
+    {
+        usb_log("FAKECHIP", "%s: r01=%02x r02=%02x r03=%02x r04=%02x exp R=%02x%02x G=%02x%02x B=%02x%02x "
+                "r19=%02x lperiod=%02x%02x dpiset=%02x%02x r67=%02x r68=%02x r6c=%02x r87=%02x "
+                "lincnt=%02x%02x%02x feedl=%02x%02x%02x", what,
+                regs[0x01], regs[0x02], regs[0x03], regs[0x04], regs[0x10], regs[0x11], regs[0x12], regs[0x13],
+                regs[0x14], regs[0x15], regs[0x19], regs[0x38], regs[0x39], regs[0x2c], regs[0x2d],
+                regs[0x67], regs[0x68], regs[0x6c], regs[0x87], regs[0x25], regs[0x26], regs[0x27],
+                regs[0x3d], regs[0x3e], regs[0x3f]);
+    }
+
     void control(int rtype, int req, int value, int len, unsigned char* data)
     {
         const bool in = (rtype & 0x80) != 0;
         if (!in && req == 0x0c && value == 0x83 && len >= 1) cur = data[0];
-        else if (!in && req == 0x0c && value == 0x85 && len >= 1) regs[cur] = data[0];
+        else if (!in && req == 0x0c && value == 0x85 && len >= 1) {
+            regs[cur] = data[0];
+            if (cur == 0x0f && (data[0] & 0x01)) snapshot("start");
+        }
         else if (in && req == 0x0c && value == 0x84 && len >= 1) data[0] = read(cur);
         else if (!in && req == 0x04 && value == 0x83) {
-            for (int i = 0; i + 1 < len; i += 2) regs[data[i]] = data[i + 1];
+            for (int i = 0; i + 1 < len; i += 2) {
+                regs[data[i]] = data[i + 1];
+            }
+            for (int i = 0; i + 1 < len; i += 2)
+                if (data[i] == 0x0f && (data[i + 1] & 0x01)) snapshot("start(bulk)");
         } else if (!in && req == 0x04 && value == 0x82 && len >= 8) {
             size_t size = data[4] | (data[5] << 8) | (data[6] << 16) | (static_cast<size_t>(data[7]) << 24);
             if (data[0] == 0x00) pending_in = size; // BULK_IN
