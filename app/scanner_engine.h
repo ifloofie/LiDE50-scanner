@@ -4,6 +4,7 @@
 #pragma once
 
 #include "image.h"
+#include "problems.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -43,7 +44,11 @@ enum class EngineEvent {
     Status,           // text = status message
     Parking,          // image delivered; scan head is returning to the start
     Idle,             // scanner finished all work (head parked); ready for the next scan
+    Warning,          // the scan finished but may be wrong; details in take_problem()
+    EngineStopped,    // the scanner thread ended unexpectedly; details in take_problem()
 };
+// ConnectFailed, ScanFailed, Warning and EngineStopped each come with one Problem
+// (take_problem() on the UI thread, in the order the events arrive).
 
 class ScannerEngine {
 public:
@@ -74,6 +79,8 @@ public:
 
     ScanProgress& progress() { return progress_; }
     Image take_result();
+    Problem take_problem();
+    bool thread_alive() const { return thread_alive_; }
 
 private:
     enum class Cmd { Connect, Disconnect, Scan, Quit };
@@ -81,14 +88,16 @@ private:
 
     void thread_entry();
     void thread_main();
-    template <class F> bool guarded(const char* what, F&& fn);
+    template <class F> bool guarded(const char* what, F&& fn, std::string* why = nullptr, bool* out_of_memory = nullptr);
     void log_options();
     void do_connect();
     void do_close();
     void do_scan(const ScanRequest& req);
     void poll_buttons();
-    bool set_option(const char* name, const void* value);
+    bool set_option(const char* name, const void* value, int* status = nullptr);
     int find_option(const char* name);
+    void post_problem(EngineEvent e, Problem p, const std::string& text = "");
+    void check_scan_quality(const Image& img, bool color);
 
     Callback cb_;
     void* thread_ = nullptr;
@@ -111,4 +120,7 @@ private:
     ScanProgress progress_;
     std::mutex result_mutex_;
     Image result_;
+    std::mutex problems_mutex_;
+    std::deque<Problem> problems_;
+    std::atomic<bool> thread_alive_{false};
 };

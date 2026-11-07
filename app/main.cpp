@@ -35,6 +35,7 @@
 
 #include "image.h"
 #include "log.h"
+#include "problems.h"
 #include "process.h"
 #include "scanner_engine.h"
 #include "ui/gfx.h"
@@ -51,8 +52,15 @@ const wchar_t kMainClass[] = L"LiDE50ScanGlass";
 
 enum : UINT {
     WM_ENGINE = WM_APP + 1,      // wParam = EngineEvent, lParam = std::string*
-    WM_SETUP_DONE = WM_APP + 2,  // wParam = success, lParam = std::wstring*
-    WM_SAVE_DONE = WM_APP + 3,   // wParam = success, lParam = std::wstring*
+    WM_SETUP_DONE = WM_APP + 2,  // lParam = TaskResult*
+    WM_SAVE_DONE = WM_APP + 3,   // lParam = TaskResult*
+};
+
+// result of a background task (saving, access setup)
+struct TaskResult {
+    bool ok = false;
+    std::wstring message;   // shown on success
+    Problem problem;        // shown on failure
 };
 
 enum : int { ID_PREVIEW = 100, ID_SCAN, ID_SAVE_PAGE, ID_SAVE_ALL, ID_SHOWGLASS };
@@ -123,6 +131,10 @@ std::wstring g_scanner_detail = L"Looking for the scanner";
 std::wstring g_status;
 bool g_setup_running = false;
 std::atomic<bool> g_saving{false};
+Problem g_scanner_problem;          // why the scanner can't be used right now (sidebar card)
+ScanRequest g_last_request;         // for "Try again"
+bool g_have_last_request = false;
+bool g_settings_writable = true;
 
 // settings
 bool g_dark = false;
@@ -244,6 +256,110 @@ void frame_now()
 }
 
 void set_status(const std::wstring& s) { g_status = s; redraw(); }
+
+void run_access_setup(bool remove);
+void begin_scan(const ScanRequest& r);
+void check_scanner();
+
+bool copy_to_clipboard(const std::wstring& text)
+{
+    if (!OpenClipboard(g_main)) return false;
+    bool ok = false;
+    EmptyClipboard();
+    size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+        if (void* dst = GlobalLock(mem)) {
+            std::memcpy(dst, text.c_str(), bytes);
+            GlobalUnlock(mem);
+            ok = SetClipboardData(CF_UNICODETEXT, mem) != nullptr;
+        }
+        if (!ok) GlobalFree(mem);
+    }
+    CloseClipboard();
+    return ok;
+}
+
+// A report the user can paste into a bug report: the problem, the app and Windows
+// versions, and the end of the log.
+void copy_problem_report(const Problem* p)
+{
+    std::wstring t = L"LiDE50 Scan " + widen(app_version()) + L" on " + windows_version_text() + L"\n";
+    if (g_simulate) t += L"(simulation mode)\n";
+    if (g_fake_usb) t += L"(fake USB test device)\n";
+    t += L"\n";
+    if (p && !p->empty()) t += p->report_text() + L"\n";
+    t += L"Log file: " + log_path() + L"\n\n--- last part of the log ---\n";
+    std::string tail = log_tail(48 * 1024);
+    // keep the clipboard text a reasonable size: about the last 400 lines
+    size_t lines = 0, cut = tail.size();
+    while (cut > 0 && lines < 400) {
+        size_t nl = tail.rfind('\n', cut - 1);
+        if (nl == std::string::npos) { cut = 0; break; }
+        cut = nl;
+        ++lines;
+    }
+    if (cut > 0) tail.erase(0, cut + 1);
+    t += widen(tail);
+    if (copy_to_clipboard(t)) {
+        LOG_UI("copied a problem report (%s) to the clipboard", p ? p->code.c_str() : "general");
+        g_ui.toast(L"Details copied. Paste them into your report or message.", 1);
+    } else {
+        g_ui.toast(L"Couldn't copy to the clipboard. Open the log from the ⋯ menu instead.", 2);
+    }
+}
+
+void run_fix(FixAction fix, const std::function<void()>& retry)
+{
+    switch (fix) {
+        case FixAction::EnableAccess: run_access_setup(false); break;
+        case FixAction::ManualSetup:
+            g_ui.alert(L"Manual setup", usb_manual_setup_instructions(), {L"OK"}, nullptr);
+            break;
+        case FixAction::OpenDeviceManager:
+            ShellExecuteW(g_main, L"open", L"devmgmt.msc", nullptr, nullptr, SW_SHOWNORMAL);
+            break;
+        case FixAction::OpenRansomwareSettings:
+            if (reinterpret_cast<INT_PTR>(ShellExecuteW(g_main, L"open", L"windowsdefender://ransomwareprotection",
+                                                        nullptr, nullptr, SW_SHOWNORMAL)) <= 32)
+                g_ui.toast(L"Open Windows Security from the Start menu, then Virus & threat protection.", 2);
+            break;
+        case FixAction::TryAgain:
+            if (retry) retry();
+            break;
+        case FixAction::RestartApp:
+        case FixAction::None: break;
+    }
+}
+
+// Shows a problem with its steps. `retry` runs for a "Try again" fix.
+void show_problem(const Problem& p, std::function<void()> retry = {})
+{
+    if (p.empty()) return;
+    logf(p.warning ? "WARN" : "UI", "showing problem %s to the user: %s", p.code.c_str(), to_utf8(p.title).c_str());
+    Ui::AlertSpec a;
+    a.title = p.title;
+    a.message = p.what;
+    a.steps = p.steps;
+    a.footer = L"Code " + widen(p.code) + L". Copy details puts this message and the recent log on the clipboard "
+               L"for a bug report.";
+    a.warning = p.warning;
+    a.problem = true;
+    bool has_fix = p.fix != FixAction::None && !p.fix_label.empty() && (p.fix != FixAction::TryAgain || retry);
+    if (has_fix) a.buttons.push_back(p.fix_label);
+    a.buttons.push_back(L"Copy details");
+    a.buttons.push_back(has_fix ? L"Close" : L"OK");
+    const int copy = has_fix ? 1 : 0;
+    a.keep_open = {copy};
+    a.def = has_fix ? 0 : copy + 1;
+    a.cancel = static_cast<int>(a.buttons.size()) - 1;
+    Problem keep = p;
+    a.on_click = [keep, retry, has_fix, copy](int b) {
+        if (b == copy) copy_problem_report(&keep);
+        else if (has_fix && b == 0) run_fix(keep.fix, retry);
+    };
+    g_ui.alert(std::move(a));
+    redraw();
+}
 
 bool system_prefers_dark()
 {
@@ -374,15 +490,33 @@ void check_scanner()
     switch (info.state) {
         case UsbAccessState::NotConnected:
             if (g_engine.connected() && !g_engine.busy()) g_engine.disconnect();
+            g_scanner_problem = problem_not_connected();
             set_scanner_state(ScannerUi::NotFound, L"Not connected");
             break;
-        case UsbAccessState::NeedsSetup:
-            set_scanner_state(ScannerUi::NeedsSetup, L"Needs permission");
+        case UsbAccessState::NeedsSetup: {
+            if (g_engine.connected() && !g_engine.busy()) g_engine.disconnect();
+            const bool winusb = _wcsicmp(info.service.c_str(), L"WinUSB") == 0;
+            if (!info.service.empty() && !winusb) {
+                // another driver owns the scanner (for example Canon's own driver)
+                g_scanner_problem = problem_other_driver(info.service);
+                set_scanner_state(ScannerUi::NeedsSetup, L"Used by another driver");
+            } else if (info.problem != 0 && (winusb || (info.problem != 28 && info.problem != 1 &&
+                                                       info.problem != 18))) {
+                g_scanner_problem = problem_device_error(info.problem, info.service);
+                set_scanner_state(g_scanner_problem.fix == FixAction::EnableAccess ? ScannerUi::NeedsSetup
+                                                                                   : ScannerUi::Error,
+                                  L"Windows reports a problem");
+            } else {
+                g_scanner_problem = Problem();
+                set_scanner_state(ScannerUi::NeedsSetup, L"Needs permission");
+            }
             break;
+        }
         case UsbAccessState::Ready:
             if (prev != UsbAccessState::Ready || !g_engine.connected()) {
+                g_scanner_problem = Problem();
                 set_scanner_state(ScannerUi::Connecting, L"Connecting");
-                if (!g_engine.busy()) g_engine.connect();
+                if (!g_engine.busy() && g_engine.thread_alive()) g_engine.connect();
             }
             break;
     }
@@ -403,14 +537,47 @@ void begin_scan(const ScanRequest& r)
     ++g_live_gen;
     g_view = r.preview ? View::Glass : View::Scanning;
     g_ui.close_popover();
+    g_last_request = r;
+    g_have_last_request = true;
     g_engine.scan(r);
     SetTimer(g_main, TIMER_LIVE, 66, nullptr);
     redraw();
 }
 
+// Repeats the last preview or scan (the "Try again" button).
+void retry_last_scan()
+{
+    if (!g_have_last_request) return;
+    if (!g_engine.connected() || g_engine.busy()) {
+        g_ui.toast(g_engine.busy() ? L"The scanner is still busy. Try again in a moment."
+                                   : L"The scanner isn't connected yet. It will reconnect by itself.", 2);
+        check_scanner();
+        return;
+    }
+    LOG_UI("clicked 'Try again'");
+    begin_scan(g_last_request);
+}
+
 void start_scan(bool preview)
 {
-    if (!g_engine.connected() || g_engine.busy()) return;
+    if (!g_engine.thread_alive()) {
+        show_problem(problem_engine_stopped("the scanner thread is not running"));
+        return;
+    }
+    if (!g_engine.connected()) {
+        if (!g_scanner_problem.empty()) {
+            show_problem(g_scanner_problem, [] {
+                g_usb_state = UsbAccessState::NotConnected;
+                check_scanner();
+            });
+        } else {
+            g_ui.toast(L"Connecting to the scanner. Try again in a moment.", 0);
+            g_usb_state = UsbAccessState::NotConnected;
+            check_scanner();
+        }
+        return;
+    }
+    if (g_engine.busy()) return;
     LOG_UI("clicked '%s'", preview ? "Preview" : "Scan");
     ScanRequest r;
     r.preview = preview;
@@ -424,8 +591,23 @@ void start_scan(bool preview)
     r.dpi = ui_dpi();
     r.mode = next_scan_mode();
     r.tl_x = g_sel.l; r.tl_y = g_sel.t; r.br_x = g_sel.r; r.br_y = g_sel.b;
+    if (r.br_x - r.tl_x < 1.0 || r.br_y - r.tl_y < 1.0) {
+        g_ui.toast(L"The selected area is too small. Drag on the glass to choose what to scan.", 2);
+        return;
+    }
     double mb = (r.br_x - r.tl_x) / 25.4 * r.dpi * (r.br_y - r.tl_y) / 25.4 * r.dpi *
                 (r.mode == ColorMode::Color ? 3 : 1) / 1048576.0;
+    {
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof(ms);
+        if (GlobalMemoryStatusEx(&ms)) {
+            double avail = std::min(ms.ullAvailPageFile, ms.ullAvailVirtual) / 1048576.0;
+            if (mb * 1.15 + 64 > avail) {
+                show_problem(problem_not_enough_memory(mb * 1.15 + 64, avail, true));
+                return;
+            }
+        }
+    }
     if (mb > 900) {
         wchar_t msg[300];
         swprintf(msg, 300, L"This scan needs about %.0f MB of memory and will take a long time. "
@@ -509,7 +691,19 @@ bool ask_save_path(OutFormat f, const std::wstring& suggested, std::wstring& pat
     ofn.lpstrInitialDir = dir.empty() ? nullptr : dir.c_str();
     ofn.lpstrDefExt = format_extension(f);
     ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-    if (!GetSaveFileNameW(&ofn)) return false;
+    if (!GetSaveFileNameW(&ofn)) {
+        DWORD e = CommDlgExtendedError();
+        if (e == 0) return false;  // the user cancelled
+        // the remembered folder or name was rejected: try once more with plain defaults
+        LOG_WARN("save dialog error 0x%04lx; retrying without the remembered folder", static_cast<unsigned long>(e));
+        wcsncpy(file, name.c_str(), MAX_PATH * 4 - 1);
+        ofn.lpstrInitialDir = nullptr;
+        if (!GetSaveFileNameW(&ofn)) {
+            if (CommDlgExtendedError() != 0)
+                g_ui.toast(L"The Save dialog couldn't open. Restart LiDE50 Scan and try again.", 2);
+            return false;
+        }
+    }
     path = file;
     ini_set_str(L"last_dir", path.substr(0, path.find_last_of(L"\\/")));
     return true;
@@ -538,35 +732,80 @@ void save_pages(bool all)
     std::vector<std::pair<const Image*, Adjustments>> jobs;
     for (int i : idx) jobs.emplace_back(&g_pages[static_cast<size_t>(i)]->raw, g_pages[static_cast<size_t>(i)]->adj);
 
+    // rough memory check: the adjusted copy of each scan is made while saving
+    double need_mb = 0;
+    for (auto& j : jobs) need_mb += static_cast<double>(j.first->data.size()) / 1048576.0;
+    if (!format_multipage(f) || jobs.size() == 1) {
+        double biggest = 0;
+        for (auto& j : jobs) biggest = std::max(biggest, static_cast<double>(j.first->data.size()) / 1048576.0);
+        need_mb = biggest;  // separate files are processed one at a time
+    }
+    need_mb = need_mb * 2.2 + 32;  // adjusted copy plus encoded file
+    {
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof(ms);
+        if (GlobalMemoryStatusEx(&ms) && need_mb > std::min(ms.ullAvailPageFile, ms.ullAvailVirtual) / 1048576.0) {
+            show_problem(problem_save_memory(need_mb));
+            return;
+        }
+    }
+
     g_saving = true;
     set_status(L"Saving");
     logw("UI", L"saving " + std::to_wstring(jobs.size()) + L" scan(s) as " + format_extension(f) + L" to " + path);
     std::thread([jobs, f, path, opt]() {
         prepare_thread_for_crash_logging("save");
+        auto* result = new TaskResult();
         std::wstring err;
+        unsigned long code = 0;
+        double needed = 0, free_mb = 0;
         bool ok = true;
-        std::vector<Image> processed;
-        processed.reserve(jobs.size());
-        for (auto& j : jobs) processed.push_back(apply_adjustments(*j.first, j.second, 1.0));
-        if (format_multipage(f) || processed.size() == 1) {
-            std::vector<const Image*> ptrs;
-            for (auto& p : processed) ptrs.push_back(&p);
-            ok = write_document(path, f, ptrs, opt, err);
-        } else {
-            std::wstring base = path, ext;
-            size_t dot = path.find_last_of(L'.');
-            if (dot != std::wstring::npos && dot > path.find_last_of(L"\\/")) { base = path.substr(0, dot); ext = path.substr(dot); }
-            for (size_t i = 0; i < processed.size() && ok; ++i) {
-                wchar_t num[16];
-                swprintf(num, 16, L"_%03zu", i + 1);
-                ok = write_document(base + num + ext, f, {&processed[i]}, opt, err);
+        size_t count = 0;
+        // every error in this thread must be caught: an escaping exception would close the app
+        try {
+            if (format_multipage(f) || jobs.size() == 1) {
+                std::vector<Image> processed;
+                processed.reserve(jobs.size());
+                for (auto& j : jobs) processed.push_back(apply_adjustments(*j.first, j.second, 1.0));
+                std::vector<const Image*> ptrs;
+                for (auto& p : processed) ptrs.push_back(&p);
+                ok = write_document(path, f, ptrs, opt, err, &code, &needed, &free_mb);
+                count = ok ? processed.size() : 0;
+            } else {
+                std::wstring base = path, ext;
+                size_t dot = path.find_last_of(L'.');
+                if (dot != std::wstring::npos && (path.find_last_of(L"\\/") == std::wstring::npos ||
+                                                  dot > path.find_last_of(L"\\/"))) {
+                    base = path.substr(0, dot);
+                    ext = path.substr(dot);
+                }
+                for (size_t i = 0; i < jobs.size() && ok; ++i) {
+                    wchar_t num[16];
+                    swprintf(num, 16, L"_%03zu", i + 1);
+                    Image one = apply_adjustments(*jobs[i].first, jobs[i].second, 1.0);  // one at a time
+                    ok = write_document(base + num + ext, f, {&one}, opt, err, &code, &needed, &free_mb);
+                    if (ok) ++count;
+                }
             }
+            if (!ok) result->problem = code == ERROR_NOT_ENOUGH_MEMORY ? problem_save_memory(needed)
+                                                                        : problem_save(code, path, needed, free_mb, err);
+        } catch (const std::bad_alloc&) {
+            ok = false;
+            result->problem = problem_save_memory(0);
+        } catch (const std::exception& e) {
+            ok = false;
+            result->problem = problem_unexpected("while saving", e.what());
+        } catch (...) {
+            ok = false;
+            result->problem = problem_unexpected("while saving", "unknown error");
         }
-        if (ok) logw("INFO", L"saved " + std::to_wstring(processed.size()) + L" scan(s) to " + path);
-        else logw("ERROR", L"saving to " + path + L" failed: " + err);
-        std::wstring name = path.substr(path.find_last_of(L"\\/") + 1);
-        auto* msg = new std::wstring(ok ? L"Saved " + name : err);
-        PostMessageW(g_main, WM_SAVE_DONE, ok ? 1 : 0, reinterpret_cast<LPARAM>(msg));
+        if (ok) logw("INFO", L"saved " + std::to_wstring(count) + L" scan(s) to " + path);
+        else logw("ERROR", L"saving to " + path + L" failed (Windows error " + std::to_wstring(code) + L"): " + err);
+        if (!ok && count > 0)
+            result->problem.what += L" The first " + std::to_wstring(count) + L" file(s) were saved.";
+        result->ok = ok;
+        result->message = L"Saved " + path.substr(path.find_last_of(L"\\/") + 1);
+        if (!PostMessageW(g_main, WM_SAVE_DONE, 0, reinterpret_cast<LPARAM>(result))) delete result;
     }).detach();
 }
 
@@ -592,18 +831,22 @@ void run_access_setup(bool remove)
         sei.lpParameters = params.c_str();
         sei.nShow = SW_HIDE;
         LOG_INFO("asking Windows for administrator permission to %s scanner access", remove ? "remove" : "set up");
-        bool ok = false;
+        auto* result = new TaskResult();
         std::wstring msg;
         if (!ShellExecuteExW(&sei)) {
             DWORD e = GetLastError();
-            msg = e == ERROR_CANCELLED ? L"The Windows permission prompt was cancelled, so nothing was changed."
-                                       : L"The setup step could not start (error " + std::to_wstring(e) + L").";
+            result->problem = e == ERROR_CANCELLED ? problem_setup_cancelled() : problem_setup_not_started(e);
+        } else if (!sei.hProcess) {
+            // Windows ran it without giving a handle; check the result by looking at the scanner
+            Sleep(3000);
+            result->ok = usb_detect_lide50().state == UsbAccessState::Ready || remove;
+            result->message = L"Done.";
+            if (!result->ok) result->problem = problem_setup_timeout();
         } else {
-            WaitForSingleObject(sei.hProcess, 120000);
+            DWORD wait = WaitForSingleObject(sei.hProcess, 120000);
             DWORD code = 1;
-            GetExitCodeProcess(sei.hProcess, &code);
+            if (wait == WAIT_OBJECT_0) GetExitCodeProcess(sei.hProcess, &code);
             CloseHandle(sei.hProcess);
-            ok = code == 0;
             FILE* f = _wfopen(result_file.c_str(), L"rt, ccs=UTF-16LE");
             if (f) {
                 wchar_t line[1024];
@@ -611,9 +854,18 @@ void run_access_setup(bool remove)
                 fclose(f);
                 DeleteFileW(result_file.c_str());
             }
-            if (msg.empty()) msg = ok ? L"Done." : L"Setup failed.";
+            if (wait != WAIT_OBJECT_0) {
+                result->problem = problem_setup_timeout();
+            } else if (code == 0) {
+                result->ok = true;
+                result->message = msg.empty() ? L"Done." : msg;
+            } else {
+                result->problem = problem_setup_failed(msg.empty() ? L"The setup step ended with code " +
+                                                                         std::to_wstring(code) + L"."
+                                                                   : msg);
+            }
         }
-        PostMessageW(g_main, WM_SETUP_DONE, ok ? 1 : 0, reinterpret_cast<LPARAM>(new std::wstring(msg)));
+        if (!PostMessageW(g_main, WM_SETUP_DONE, 0, reinterpret_cast<LPARAM>(result))) delete result;
     }).detach();
 }
 
@@ -662,7 +914,7 @@ void set_theme(bool dark)
 
 void show_about()
 {
-    g_ui.alert(L"LiDE50 Scan 1.3",
+    g_ui.alert(L"LiDE50 Scan 1.4",
                L"Portable scanning for the Canon CanoScan LiDE 50 on 64-bit Windows. The scanner driver is built "
                L"in and talks to the scanner through Windows' own WinUSB driver, so nothing else needs installing.\n\n"
                L"Built on the SANE genesys backend (GPL-2.0-or-later), libusb (LGPL-2.1), miniz (MIT) and "
@@ -703,6 +955,15 @@ void open_more_menu(const RectF& anchor)
     m.push_back({L"Manual setup steps", Icon::Doc, true, true,
                  [] { g_ui.alert(L"Manual setup", usb_manual_setup_instructions(), {L"OK"}, nullptr); }});
     m.push_back({L"", Icon::Check, false, false, nullptr, true});
+    m.push_back({L"Help: scanner not found", Icon::Wand, true, true, [] { show_problem(help_not_found()); }});
+    m.push_back({L"Help: colours look wrong", Icon::Wand, true, true, [] { show_problem(help_colours()); }});
+    m.push_back({L"Help: noise or stretched scans", Icon::Wand, true, true,
+                 [] { show_problem(help_noise_stretched()); }});
+    m.push_back({L"Help: the app closes", Icon::Wand, true, true, [] { show_problem(help_crashes()); }});
+    m.push_back({L"Copy a problem report", Icon::Doc, true, true, [] {
+                     copy_problem_report(g_scanner_problem.empty() ? nullptr : &g_scanner_problem);
+                 }});
+    m.push_back({L"", Icon::Check, false, false, nullptr, true});
     m.push_back({L"Open the log file", Icon::Doc, true, true, [] {
                      ShellExecuteW(g_main, L"open", L"notepad.exe", (L"\"" + log_path() + L"\"").c_str(), nullptr,
                                    SW_SHOWNORMAL);
@@ -725,10 +986,11 @@ void on_engine_event(EngineEvent e, const std::string& text)
 {
     static const char* names[] = {"Connected", "ConnectFailed", "ScanStarted", "ScanFinished",
                                   "ScanFailed", "ScanCancelled", "ButtonPressed", "Status",
-                                  "Parking", "Idle"};
-    int ei = static_cast<int>(e);
+                                  "Parking", "Idle", "Warning", "EngineStopped"};
+    const int ei = static_cast<int>(e);
+    const int name_count = static_cast<int>(sizeof(names) / sizeof(names[0]));
     logf(e == EngineEvent::ScanFailed || e == EngineEvent::ConnectFailed ? "WARN" : "UI", "event %s%s%s",
-         (ei >= 0 && ei < 10) ? names[ei] : "?", text.empty() ? "" : ": ", text.c_str());
+         (ei >= 0 && ei < name_count) ? names[ei] : "?", text.empty() ? "" : ": ", text.c_str());
     switch (e) {
         case EngineEvent::Connected:
             g_scanner_name = widen(text);
@@ -740,11 +1002,13 @@ void on_engine_event(EngineEvent e, const std::string& text)
             else apply_area_preset(g_area_idx);
             break;
         case EngineEvent::ConnectFailed: {
-            std::wstring t = widen(text);
-            bool access = t.find(L"access") != std::wstring::npos;
-            set_scanner_state(access && !g_simulate ? ScannerUi::NeedsSetup : ScannerUi::Error,
-                              access ? L"Needs permission" : L"Couldn't connect");
-            g_status = t;
+            Problem p = g_engine.take_problem();
+            if (p.empty()) p = problem_open_failed(0, text);
+            g_scanner_problem = p;
+            g_status.clear();
+            set_scanner_state(p.fix == FixAction::EnableAccess && !g_simulate ? ScannerUi::NeedsSetup
+                                                                              : ScannerUi::Error,
+                              p.title);
             break;
         }
         case EngineEvent::Status:
@@ -788,18 +1052,46 @@ void on_engine_event(EngineEvent e, const std::string& text)
             redraw();
             break;
         }
-        case EngineEvent::ScanFailed:
+        case EngineEvent::ScanFailed: {
             KillTimer(g_main, TIMER_LIVE);
             g_live = Image();
             g_gi_live.release();
             if (g_view == View::Scanning) g_view = g_pages.empty() ? View::Glass : View::Page;
             if (g_view == View::Page && !selected_page()) g_view = View::Glass;
-            if (!g_engine.connected()) set_scanner_state(ScannerUi::Connecting, L"Reconnecting");
             g_status.clear();
-            g_ui.alert(L"The scan didn't finish", widen(text), {L"OK"}, nullptr);
-            check_scanner();
+            Problem p = g_engine.take_problem();
+            if (p.empty()) p = problem_unexpected("during the scan", text);
+            // "not connected" while a connection problem is known: show the real reason
+            if (p.code == "USB-NOT-FOUND" && !g_scanner_problem.empty()) p = g_scanner_problem;
+            show_problem(p, [] { retry_last_scan(); });
+            if (!g_engine.connected()) {
+                set_scanner_state(ScannerUi::Connecting, L"Reconnecting");
+                g_usb_state = UsbAccessState::NotConnected;  // reconnect on the next check
+                SetTimer(g_main, TIMER_USBCHECK, 1500, nullptr);
+            }
             redraw();
             break;
+        }
+        case EngineEvent::Warning: {
+            Problem p = g_engine.take_problem();
+            if (!p.empty()) show_problem(p, [] { retry_last_scan(); });
+            break;
+        }
+        case EngineEvent::EngineStopped: {
+            KillTimer(g_main, TIMER_LIVE);
+            g_live = Image();
+            g_gi_live.release();
+            if (g_view == View::Scanning) g_view = g_pages.empty() ? View::Glass : View::Page;
+            if (g_view == View::Page && !selected_page()) g_view = View::Glass;
+            g_status.clear();
+            Problem p = g_engine.take_problem();
+            if (p.empty()) p = problem_engine_stopped(text);
+            g_scanner_problem = p;
+            set_scanner_state(ScannerUi::Error, p.title);
+            show_problem(p);
+            redraw();
+            break;
+        }
         case EngineEvent::ScanCancelled:
             KillTimer(g_main, TIMER_LIVE);
             g_live = Image();
@@ -816,6 +1108,12 @@ void on_engine_event(EngineEvent e, const std::string& text)
             break;
         case EngineEvent::Idle:
             g_status.clear();
+            if (!g_engine.connected() && g_engine.thread_alive()) {
+                // the connection was closed after a USB error: reconnect shortly
+                set_scanner_state(ScannerUi::Connecting, L"Reconnecting");
+                g_usb_state = UsbAccessState::NotConnected;
+                SetTimer(g_main, TIMER_USBCHECK, 1500, nullptr);
+            }
             redraw();
             break;
         case EngineEvent::ButtonPressed:
@@ -1258,23 +1556,44 @@ void draw_sidebar(const RectF& panel)
 
     if (g_scanner_ui == ScannerUi::NeedsSetup || g_scanner_ui == ScannerUi::NotFound ||
         g_scanner_ui == ScannerUi::Error) {
-        std::wstring msg = g_scanner_ui == ScannerUi::NeedsSetup
+        const Problem& sp = g_scanner_problem;
+        std::wstring msg = !sp.empty() && g_scanner_ui != ScannerUi::NotFound ? sp.what
+                           : g_scanner_ui == ScannerUi::NeedsSetup
                                ? L"Windows needs your permission once so LiDE50 Scan can talk to the scanner."
                            : g_scanner_ui == ScannerUi::NotFound
                                ? L"Connect the scanner with its USB cable. It's powered over USB, so there's no power cable."
-                               : (g_status.empty() ? std::wstring(L"The scanner couldn't be opened.") : g_status);
+                               : std::wstring(L"The scanner couldn't be opened.");
+        const bool enable = g_scanner_ui == ScannerUi::NeedsSetup && !g_simulate;
+        const bool help = !sp.empty();
         float th = gx.text_height(msg, 12.5f, 400, g_w - 28.0f);
-        float gh = th + 28.0f + (g_scanner_ui == ScannerUi::NeedsSetup ? 46.0f : 0.0f);
+        float gh = th + 28.0f + (enable ? 46.0f : 0.0f) + (help ? 42.0f : 0.0f);
         RectF grp{g_x0, g_y, g_w, gh};
         ui.group(grp, 14.0f);
         gx.text(msg, RectF{grp.x + 14.0f, grp.y + 14.0f, g_w - 28.0f, th + 2.0f}, 12.5f, 400, ui.t.text2,
                 Align::Start, Align::Start, true);
-        if (g_scanner_ui == ScannerUi::NeedsSetup) {
-            if (ui.button("enable", RectF{grp.x + 14.0f, grp.b() - 48.0f, g_w - 28.0f, 36.0f},
-                          g_setup_running ? L"Waiting for Windows" : L"Enable scanner access", Icon::Shield, true,
+        float by = grp.y + 14.0f + th + 10.0f;
+        if (enable) {
+            std::wstring label = g_setup_running ? L"Waiting for Windows"
+                                 : (!sp.empty() && sp.fix == FixAction::EnableAccess && !sp.fix_label.empty())
+                                     ? sp.fix_label
+                                     : std::wstring(L"Enable scanner access");
+            if (ui.button("enable", RectF{grp.x + 14.0f, by, g_w - 28.0f, 36.0f}, label, Icon::Shield, true,
                           ButtonStyle::Primary, !g_setup_running)) {
                 LOG_UI("clicked 'Enable scanner access'");
                 ui.defer([] { run_access_setup(false); });
+            }
+            by += 46.0f;
+        }
+        if (help) {
+            if (ui.button("problem.help", RectF{grp.x + 14.0f, by, g_w - 28.0f, 32.0f}, L"What to try", Icon::Wand,
+                          true, ButtonStyle::Glass)) {
+                LOG_UI("clicked 'What to try' for %s", sp.code.c_str());
+                ui.defer([] {
+                    show_problem(g_scanner_problem, [] {
+                        g_usb_state = UsbAccessState::NotConnected;
+                        check_scanner();
+                    });
+                });
             }
         }
         g_y += gh + 8.0f;
@@ -1650,11 +1969,83 @@ void draw_scans(const RectF& panel)
 
 // ----------------------------------------------------------------- frame
 
+void render_frame();
+
+// Draws one frame. An error while drawing (for example running out of memory while
+// preparing a very large scan for the screen) is reported instead of closing the app.
 void render()
 {
     if (g_rendering) return;
     g_rendering = true;
-    if (!gx.begin()) { g_rendering = false; return; }
+    if (!gx.begin()) {
+        g_rendering = false;
+        static double last_warn = -100;
+        if (now_seconds() - last_warn > 30) {
+            last_warn = now_seconds();
+            LOG_WARN("drawing: Direct2D could not start a frame; retrying");
+        }
+        return;
+    }
+    std::string failure;
+    bool oom = false;
+    try {
+        render_frame();
+    } catch (const std::bad_alloc&) {
+        failure = "out of memory";
+        oom = true;
+    } catch (const std::exception& e) {
+        failure = e.what();
+    } catch (...) {
+        failure = "unknown error";
+    }
+    if (!failure.empty()) {
+        // finish the frame cleanly so the next one can start
+        try {
+            ui.end_frame();
+        } catch (...) {
+        }
+        gx.end();
+        g_rendering = false;
+        static double last_report = -100;
+        if (now_seconds() - last_report > 10) {
+            last_report = now_seconds();
+            LOG_ERROR("drawing failed: %s", failure.c_str());
+            Problem p = oom ? problem_not_enough_memory(0, 0, false)
+                            : problem_unexpected("while drawing the window", failure);
+            if (oom) {
+                p.what = L"There isn't enough memory to show the scan on screen. Your scans are still here.";
+            }
+            show_problem(p);
+        }
+        ui.take_deferred();
+        return;
+    }
+    gx.end();
+    g_rendering = false;
+
+    for (auto& fn : ui.take_deferred()) {
+        try {
+            fn();
+        } catch (const std::bad_alloc&) {
+            LOG_ERROR("action failed: out of memory");
+            show_problem(problem_not_enough_memory(0, 0, false));
+        } catch (const std::exception& e) {
+            LOG_ERROR("action failed: %s", e.what());
+            show_problem(problem_unexpected("while doing that", e.what()));
+        }
+    }
+    // 60 fps while something animates, 30 fps when only the background drifts
+    UINT interval = ui.wants_frame() ? 15 : ui.wants_slow_frame() ? 33 : 0;
+    static UINT current = 0;
+    if (interval != current) {
+        if (interval) SetTimer(g_main, TIMER_FRAME, interval, nullptr);
+        else KillTimer(g_main, TIMER_FRAME);
+        current = interval;
+    }
+}
+
+void render_frame()
+{
     ui.begin_frame(now_seconds());
     float th = ui.anim("theme", g_dark ? 1.0f : 0.0f, 7.0f);
     ui.t = mix(theme_light(), theme_dark(), th);
@@ -1675,18 +2066,6 @@ void render()
     draw_toolbar(center);
 
     ui.end_frame();
-    gx.end();
-    g_rendering = false;
-
-    for (auto& fn : ui.take_deferred()) fn();
-    // 60 fps while something animates, 30 fps when only the background drifts
-    UINT interval = ui.wants_frame() ? 15 : ui.wants_slow_frame() ? 33 : 0;
-    static UINT current = 0;
-    if (interval != current) {
-        if (interval) SetTimer(g_main, TIMER_FRAME, interval, nullptr);
-        else KillTimer(g_main, TIMER_FRAME);
-        current = interval;
-    }
 }
 
 // ----------------------------------------------------------------- window
@@ -1708,7 +2087,32 @@ void set_mouse(LPARAM lp)
     ui.my = GET_Y_LPARAM(lp) * 96.0f / g_dpi;
 }
 
+LRESULT main_proc_impl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+
+// Exceptions must never pass through Windows' message dispatch (that ends the process),
+// so every message is handled inside a guard.
 LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    try {
+        return main_proc_impl(hwnd, msg, wp, lp);
+    } catch (const std::bad_alloc&) {
+        LOG_ERROR("window message 0x%04x: out of memory", msg);
+        g_rendering = false;
+        if (g_main) show_problem(problem_not_enough_memory(0, 0, false));
+    } catch (const std::exception& e) {
+        LOG_ERROR("window message 0x%04x failed: %s", msg, e.what());
+        log_stack_trace("stack at the time of the error:");
+        g_rendering = false;
+        if (g_main) show_problem(problem_unexpected("in the window", e.what()));
+    } catch (...) {
+        LOG_ERROR("window message 0x%04x failed with an unknown error", msg);
+        g_rendering = false;
+        if (g_main) show_problem(problem_unexpected("in the window", "unknown error"));
+    }
+    return msg == WM_CREATE ? -1 : 0;
+}
+
+LRESULT main_proc_impl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
         case WM_CREATE: {
@@ -1861,26 +2265,39 @@ LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         case WM_SETUP_DONE: {
-            std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lp));
+            std::unique_ptr<TaskResult> r(reinterpret_cast<TaskResult*>(lp));
             g_setup_running = false;
             g_status.clear();
-            logw(wp ? "INFO" : "WARN", L"scanner access setup result: " + *text);
-            ui.alert(wp ? L"Scanner access is set up" : L"Setup didn't finish", *text, {L"OK"}, nullptr);
+            logw(r->ok ? "INFO" : "WARN", L"scanner access setup result: " + (r->ok ? r->message : r->problem.title));
+            if (r->ok) {
+                ui.alert(L"Scanner access is set up", r->message, {L"OK"}, nullptr);
+            } else {
+                Problem pr = r->problem;
+                // the manual steps belong with the failure message
+                if (pr.code == "SETUP-FAILED") pr.details += L"\n\n" + usb_manual_setup_instructions();
+                show_problem(pr);
+            }
             g_usb_state = UsbAccessState::NotConnected;  // force a reconnect
             check_scanner();
             redraw();
             return 0;
         }
         case WM_SAVE_DONE: {
-            std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lp));
+            std::unique_ptr<TaskResult> r(reinterpret_cast<TaskResult*>(lp));
             g_saving = false;
             g_status.clear();
-            if (wp) ui.toast(*text, 1);
-            else ui.alert(L"The file wasn't saved", *text, {L"OK"}, nullptr);
+            if (r->ok) ui.toast(r->message, 1);
+            else show_problem(r->problem, [] { save_pages(false); });
             redraw();
             return 0;
         }
         case WM_CLOSE:
+            if (g_saving) {
+                // the save thread is still reading the scans; closing now would lose the file
+                ui.toast(L"Still saving. LiDE50 Scan closes when you try again after it's done.", 2);
+                redraw();
+                return 0;
+            }
             if (!g_force_close && !g_pages.empty()) {
                 ui.alert(L"Close LiDE50 Scan?", L"Scans you haven't saved will be lost.", {L"Keep working", L"Close"},
                          [](int b) {
@@ -1947,6 +2364,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
         CoTaskMemFree(p);
     }
     CreateDirectoryW(g_data_dir.c_str(), nullptr);
+    g_settings_writable = dir_writable(g_data_dir);
     g_ini = g_data_dir + L"\\settings.ini";
 
     if (!GetStdHandle(STD_ERROR_HANDLE) || GetStdHandle(STD_ERROR_HANDLE) == INVALID_HANDLE_VALUE) {
@@ -1954,8 +2372,28 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
         freopen("NUL", "w", stderr);
     }
     log_open(dir, g_data_dir);
+    // a crash marker left by the previous run: read it, then remove it
+    const std::wstring crash_marker = g_data_dir + L"\\last_crash.txt";
+    std::wstring previous_crash_when, previous_crash_what;
+    bool previous_crash = false;
+    if (FILE* cf = _wfopen(crash_marker.c_str(), L"rb")) {
+        char buf[700] = {};
+        size_t n = fread(buf, 1, sizeof(buf) - 1, cf);
+        fclose(cf);
+        std::string t(buf, n);
+        size_t nl = t.find('\n');
+        previous_crash_when = widen(t.substr(0, nl));
+        if (nl != std::string::npos) previous_crash_what = widen(t.substr(nl + 1));
+        while (!previous_crash_what.empty() && (previous_crash_what.back() == L'\n' || previous_crash_what.back() == L'\r'))
+            previous_crash_what.pop_back();
+        previous_crash = true;
+        DeleteFileW(crash_marker.c_str());
+    }
+    log_set_crash_marker(crash_marker);
     install_crash_handlers();
     log_system_info(g_data_dir, GetCommandLineW());
+    if (previous_crash) logw("WARN", L"the previous run crashed on " + previous_crash_when + L": " + previous_crash_what);
+    if (!g_settings_writable) logw("WARN", L"the settings folder can't be written: " + g_data_dir);
     if (g_log) lide50_set_usb_trace(1);
     if (g_fake_usb) g_simulate = false;
 
@@ -2025,9 +2463,28 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
     // Driver detail: 4 = steps, calibration results, warnings and errors (default);
     // 7 = every register access and USB transfer (start with --log).
     g_engine.start(g_data_dir, g_simulate, g_fake_usb, g_log ? 7 : 4, [](EngineEvent e, const std::string& text) {
-        PostMessageW(g_main, WM_ENGINE, static_cast<WPARAM>(e), reinterpret_cast<LPARAM>(new std::string(text)));
+        auto* copy = new std::string(text);
+        if (!g_main || !PostMessageW(g_main, WM_ENGINE, static_cast<WPARAM>(e), reinterpret_cast<LPARAM>(copy)))
+            delete copy;
     });
     check_scanner();
+    if (previous_crash) {
+        // attach the crash report from the log, so "Copy details" always includes it
+        std::wstring report = previous_crash_what;
+        std::string tail = log_tail(512 * 1024);
+        size_t a = tail.rfind("==================== CRASH");
+        if (a != std::string::npos) {
+            size_t line_start = tail.rfind('\n', a);
+            line_start = line_start == std::string::npos ? 0 : line_start + 1;
+            size_t b = tail.find("===============================================", a + 10);
+            size_t end = b == std::string::npos ? std::min(tail.size(), a + 8000) : tail.find('\n', b);
+            if (end == std::string::npos) end = tail.size();
+            report += L"\n\nCrash report from the log:\n" + widen(tail.substr(line_start, end - line_start));
+        }
+        show_problem(problem_previous_crash(previous_crash_when, report));
+    }
+    if (!g_settings_writable)
+        g_ui.toast(L"Settings and calibration can't be saved: Windows doesn't allow writing to the settings folder.", 2);
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {

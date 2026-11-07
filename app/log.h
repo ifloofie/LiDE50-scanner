@@ -40,3 +40,12 @@ void log_stack_trace(const char* reason);
 
 // Logs a summary of the computer (Windows version, memory, paths).
 void log_system_info(const std::wstring& data_dir, const std::wstring& command_line);
+
+// "1.4.0"
+const char* app_version();
+// "Windows 10.0 build 26200"
+std::wstring windows_version_text();
+// The last `max_bytes` of the log file, starting at a whole line.
+std::string log_tail(size_t max_bytes);
+// File written when the app crashes; the next start reads it and explains what happened.
+void log_set_crash_marker(const std::wstring& path);

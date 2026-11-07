@@ -1900,10 +1900,15 @@ void scanner_coarse_gain_calibration(Genesys_Device& dev, const Genesys_Sensor& 
 
         DBG(DBG_proc, "%s: channel %d, curr=%f, target=%f, out_gain:%d\n", __func__, ch,
             curr_output, target_value, out_gain);
+        if (ch < 3) {
+            lide50_diag_calib()->white_level[ch] = static_cast<unsigned>(std::max(0.0f, curr_output));
+        }
 
         if (dev.model->asic_type == AsicType::GL841 &&
-            target_value / curr_output > 30)
+            (curr_output <= 0 || target_value / curr_output > 30))
         {
+            static const char* names[] = {"red", "green", "blue"};
+            const char* colour = channels == 1 ? "gray" : names[std::min(ch, 2u)];
             DBG(DBG_error0, "****************************************\n");
             DBG(DBG_error0, "*                                      *\n");
             DBG(DBG_error0, "*  Extremely low Brightness detected.  *\n");
@@ -1911,7 +1916,15 @@ void scanner_coarse_gain_calibration(Genesys_Device& dev, const Genesys_Sensor& 
             DBG(DBG_error0, "*  unlocked and moving.                *\n");
             DBG(DBG_error0, "*                                      *\n");
             DBG(DBG_error0, "****************************************\n");
-            throw SaneException(SANE_STATUS_JAMMED, "scanning head is locked");
+            DBG(DBG_error0, "%s: the %s light measured %.0f of %.0f expected (exposure %d, %d, %d)\n",
+                __func__, colour, curr_output, target_value, calib_sensor->exposure.red,
+                calib_sensor->exposure.green, calib_sensor->exposure.blue);
+            lide50_diag_calib()->low_light_channel = channels == 1 ? 1 : static_cast<int>(ch);
+            // LiDE50 Scan: return the head home before failing, so the next try starts cleanly
+            catch_all_exceptions(__func__, [&]() { scanner_stop_action(dev); });
+            catch_all_exceptions(__func__, [&]() { dev.cmd_set->move_back_home(&dev, true); });
+            throw SaneException(SANE_STATUS_JAMMED,
+                                "the sensor saw almost no %s light during calibration", colour);
         }
 
         dbg.vlog(DBG_info, "gain=(%d, %d, %d)", dev.frontend.get_gain(0), dev.frontend.get_gain(1),
@@ -2018,6 +2031,29 @@ SensorExposure scanner_led_calibration(Genesys_Device& dev, const Genesys_Sensor
 
     std::uint16_t target = sensor.gain_white_ref * 256;
 
+    // LiDE50 Scan: the GL841 loop below used to be able to drive an exposure to 0 (or wrap it
+    // past 65535). Once that happened the value was copied into the sensor table, every later
+    // calibration started from it and could never recover (0 * anything = 0), so that colour
+    // stayed dark until the app was restarted: green-only scans and false "head locked" errors.
+    // Start from a safe value, keep every step in a safe range, and report what happened.
+    Lide50CalibReport* report = lide50_diag_calib();
+    const unsigned default_exp[3] = { dev.lide50_default_exposure.red,
+                                      dev.lide50_default_exposure.green,
+                                      dev.lide50_default_exposure.blue };
+    int last_avg[3] = {0, 0, 0};
+    unsigned stuck[3] = {0, 0, 0};
+    unsigned tries = 0;
+    if (dev.model->asic_type == AsicType::GL841) {
+        for (unsigned i = 0; i < 3; i++) {
+            if (exp[i] < LIDE50_LED_EXPOSURE_MIN || exp[i] > LIDE50_LED_EXPOSURE_MAX) {
+                dbg.vlog(DBG_warn, "LED exposure %d of colour %d is out of range; starting from %d",
+                         exp[i], i, default_exp[i]);
+                exp[i] = static_cast<std::uint16_t>(default_exp[i]);
+                report->reset_bad_exposure = 1;
+            }
+        }
+    }
+
     std::uint16_t top[3] = {};
     std::uint16_t bottom[3] = {};
 
@@ -2050,7 +2086,9 @@ SensorExposure scanner_led_calibration(Genesys_Device& dev, const Genesys_Sensor
     }
 
     bool acceptable = false;
-    for (unsigned i_test = 0; i_test < 100 && !acceptable; ++i_test) {
+    bool gave_up = false;
+    for (unsigned i_test = 0; i_test < 100 && !acceptable && !gave_up; ++i_test) {
+        tries = i_test + 1;
         regs_set_exposure(dev.model->asic_type, regs, { exp[0], exp[1], exp[2] });
 
         dev.interface->write_registers(regs);
@@ -2092,6 +2130,9 @@ SensorExposure scanner_led_calibration(Genesys_Device& dev, const Genesys_Sensor
         }
 
         dbg.vlog(DBG_info, "average: %d, %d, %d", avg[0], avg[1], avg[2]);
+        for (unsigned ch = 0; ch < 3; ch++) {
+            last_avg[ch] = ch < channels ? avg[ch] : 0;
+        }
 
         acceptable = true;
 
@@ -2132,18 +2173,72 @@ SensorExposure scanner_led_calibration(Genesys_Device& dev, const Genesys_Sensor
         } else if (dev.model->asic_type == AsicType::GL841 ||
                    dev.model->asic_type == AsicType::GL124)
         {
+            bool any_moving = false;
             for (unsigned i = 0; i < 3; i++) {
                 // we accept +- 2% delta from target
                 if (std::abs(avg[i] - target) > target / 50) {
-                    float prev_weight = 0.5;
-                    if (avg[i] != 0) {
-                        exp[i] = exp[i] * prev_weight + ((exp[i] * target) / avg[i]) * (1 - prev_weight);
+                    const double prev_weight = 0.5;
+                    double next;
+                    if (avg[i] > 0) {
+                        next = exp[i] * prev_weight +
+                               (static_cast<double>(exp[i]) * target / avg[i]) * (1 - prev_weight);
                     } else {
-                        exp[i] = exp[i] * prev_weight + (exp[i] * 10) * (1 - prev_weight);
+                        next = exp[i] * prev_weight + (exp[i] * 10.0) * (1 - prev_weight);
                     }
+                    next = std::clamp(next, static_cast<double>(LIDE50_LED_EXPOSURE_MIN),
+                                      static_cast<double>(LIDE50_LED_EXPOSURE_MAX));
+                    auto next_exp = static_cast<std::uint16_t>(next + 0.5);
+                    // count tries where the exposure is pinned at a limit and cannot change
+                    stuck[i] = next_exp == exp[i] ? stuck[i] + 1 : 0;
+                    if (stuck[i] < 3) {
+                        any_moving = true;
+                    }
+                    exp[i] = next_exp;
                     acceptable = false;
+                } else {
+                    stuck[i] = 0;
                 }
             }
+            // every colour that is still off target is pinned at a limit: more tries can't help
+            if (!acceptable && !any_moving) {
+                gave_up = true;
+            }
+        }
+    }
+
+    if (dev.model->asic_type == AsicType::GL841) {
+        report->led_tries = static_cast<int>(tries);
+        report->led_target = target;
+        for (unsigned i = 0; i < 3; i++) {
+            report->led_average[i] = static_cast<unsigned>(std::max(0, last_avg[i]));
+        }
+        if (acceptable) {
+            report->led_result = LIDE50_LED_OK;
+        } else {
+            report->led_result = LIDE50_LED_UNSETTLED;
+            for (unsigned i = 0; i < 3; i++) {
+                if (last_avg[i] < static_cast<int>(target) - static_cast<int>(target / 50) &&
+                    report->led_dim_channel < 0)
+                {
+                    report->led_dim_channel = static_cast<int>(i);
+                }
+                if (last_avg[i] > static_cast<int>(target) + static_cast<int>(target / 50) &&
+                    report->led_bright_channel < 0)
+                {
+                    report->led_bright_channel = static_cast<int>(i);
+                }
+                if (exp[i] <= LIDE50_LED_EXPOSURE_MIN && last_avg[i] > static_cast<int>(target)) {
+                    report->led_saturated = 1;
+                }
+            }
+            DBG(DBG_error0, "LED calibration did not settle after %u tries (averages %d, %d, %d, "
+                "target %d, exposure %d, %d, %d)%s\n", tries, last_avg[0], last_avg[1], last_avg[2],
+                target, exp[0], exp[1], exp[2],
+                report->led_saturated ? ": too much light even at the shortest exposure "
+                                        "(lid open or bright light on the glass?)" : "");
+        }
+        for (unsigned i = 0; i < 3; i++) {
+            report->led_exposure[i] = exp[i];
         }
     }
 
@@ -3506,6 +3601,22 @@ genesys_restore_calibration(Genesys_Device * dev, Genesys_Sensor& sensor)
   for (auto& cache : dev->calibration_cache)
     {
         if (sanei_genesys_is_compatible_calibration(dev, session, &cache, false)) {
+            // LiDE50 Scan: ignore cached values that can't be right (older versions could
+            // cache an LED exposure of 0, which gives dark or single-colour scans)
+            if (dev->model->asic_type == AsicType::GL841 && dev->model->is_cis) {
+                auto bad = [](unsigned v) {
+                    return v < LIDE50_LED_EXPOSURE_MIN || v > LIDE50_LED_EXPOSURE_MAX;
+                };
+                const auto& e = cache.sensor.exposure;
+                if (bad(e.red) || bad(e.green) || bad(e.blue) ||
+                    cache.white_average_data.empty())
+                {
+                    DBG(DBG_warn, "%s: ignoring a cached calibration with invalid values "
+                        "(exposure %d, %d, %d)\n", __func__, e.red, e.green, e.blue);
+                    lide50_diag_calib()->cache_rejected = 1;
+                    continue;
+                }
+            }
             dev->frontend = cache.frontend;
           /* we don't restore the gamma fields */
           sensor.exposure = cache.sensor.exposure;
@@ -3532,6 +3643,11 @@ genesys_restore_calibration(Genesys_Device * dev, Genesys_Sensor& sensor)
 static void genesys_save_calibration(Genesys_Device* dev, const Genesys_Sensor& sensor)
 {
     DBG_HELPER(dbg);
+    // LiDE50 Scan: never keep a calibration whose LED exposure did not settle
+    if (lide50_diag_calib()->led_result == LIDE50_LED_UNSETTLED) {
+        DBG(DBG_info, "%s: not caching this calibration (LED exposure did not settle)\n", __func__);
+        return;
+    }
 #ifdef HAVE_SYS_TIME_H
   struct timeval time;
 #endif
@@ -3576,6 +3692,7 @@ static void genesys_save_calibration(Genesys_Device* dev, const Genesys_Sensor& 
 static void genesys_flatbed_calibration(Genesys_Device* dev, Genesys_Sensor& sensor)
 {
     DBG_HELPER(dbg);
+    lide50_diag_calib()->ran = 1;
     std::uint32_t pixels_per_line;
 
     unsigned coarse_res = sensor.full_resolution;
@@ -3616,9 +3733,13 @@ static void genesys_flatbed_calibration(Genesys_Device* dev, Genesys_Sensor& sen
             case AsicType::GL846:
             case AsicType::GL847: {
                 auto calib_exposure = dev->cmd_set->led_calibration(dev, sensor, local_reg);
-                for (auto& sensor_update :
-                        sanei_genesys_find_sensors_all_for_write(dev, sensor.method)) {
-                    sensor_update.get().exposure = calib_exposure;
+                // LiDE50 Scan: only a calibration that settled becomes the starting point for
+                // later scans; an unsettled one is used for this scan only
+                if (lide50_diag_calib()->led_result != LIDE50_LED_UNSETTLED) {
+                    for (auto& sensor_update :
+                            sanei_genesys_find_sensors_all_for_write(dev, sensor.method)) {
+                        sensor_update.get().exposure = calib_exposure;
+                    }
                 }
                 sensor.exposure = calib_exposure;
                 break;
@@ -5494,6 +5615,22 @@ static void sane_open_impl(SANE_String_Const devicename, SANE_Handle * handle)
 
     // some hardware capabilities are detected through sensors
     dev->cmd_set->update_hardware_sensors (s);
+
+    // LiDE50 Scan: remember the table's LED exposure (the table is rebuilt at every sane_init,
+    // so it is unchanged at this point)
+    for (const auto& sensor : sanei_genesys_find_sensors_all(dev, ScanMethod::FLATBED)) {
+        const auto& e = sensor.get().exposure;
+        auto ok = [](unsigned v) {
+            return v >= LIDE50_LED_EXPOSURE_MIN && v <= LIDE50_LED_EXPOSURE_MAX;
+        };
+        if (ok(e.red) && ok(e.green) && ok(e.blue)) {
+            dev->lide50_default_exposure = e;
+        }
+        break;
+    }
+    DBG(DBG_info, "%s: default LED exposure %d, %d, %d\n", __func__,
+        dev->lide50_default_exposure.red, dev->lide50_default_exposure.green,
+        dev->lide50_default_exposure.blue);
 }
 
 SANE_GENESYS_API_LINKAGE
