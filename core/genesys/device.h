@@ -291,6 +291,10 @@ struct Genesys_Device
     // signal whether the park command has been issued
     bool parking = false;
 
+    // LiDE50 Scan: the sensor table's LED exposure when the scanner was opened. Used to
+    // reset a calibrated exposure that is out of the safe range.
+    SensorExposure lide50_default_exposure{0x400, 0x400, 0x400};
+
     // for sheetfed scanner's, is TRUE when there is a document in the scanner
     bool document = false;
 

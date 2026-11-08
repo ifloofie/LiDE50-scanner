@@ -13,6 +13,7 @@
 #include "../core/include/sane/saneopts.h"
 
 #include "log.h"
+#include "../core/include/lide50_diag.h"
 #include <process.h>
 
 
@@ -43,9 +44,7 @@ std::string status_text(SANE_Status s)
         case SANE_STATUS_DEVICE_BUSY: return "the scanner is busy or in use by another program";
         case SANE_STATUS_INVAL: return "invalid argument";
         case SANE_STATUS_EOF: return "end of data";
-        case SANE_STATUS_JAMMED:
-            return "the scan head did not move or the sensor saw no light. If your scanner has a lock "
-                   "switch underneath, slide it to UNLOCK, close the lid, then unplug and reconnect the scanner";
+        case SANE_STATUS_JAMMED: return "the sensor saw almost no light during calibration";
         case SANE_STATUS_NO_DOCS: return "no document";
         case SANE_STATUS_COVER_OPEN: return "scanner cover is open";
         case SANE_STATUS_IO_ERROR: return "USB communication error (try unplugging and reconnecting the scanner)";
@@ -140,20 +139,58 @@ void ScannerEngine::start(const std::wstring& data_dir, bool simulate, bool fake
             return 0;
         },
         this, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr));
-    if (!thread_) LOG_ERROR("engine: could not start the scanner thread (errno %d)", errno);
+    if (!thread_) {
+        LOG_ERROR("engine: could not start the scanner thread (errno %d)", errno);
+        post_problem(EngineEvent::EngineStopped,
+                     problem_engine_stopped("the scanner thread could not be started (errno " +
+                                            std::to_string(errno) + ")"));
+    }
+}
+
+void ScannerEngine::post_problem(EngineEvent e, Problem p, const std::string& text)
+{
+    logf(p.warning ? "WARN" : "ERROR", "problem %s: %s", p.code.c_str(), to_utf8(p.title).c_str());
+    if (!p.details.empty()) logw(p.warning ? "WARN" : "ERROR", L"  details: " + p.details);
+    {
+        std::lock_guard<std::mutex> lock(problems_mutex_);
+        problems_.push_back(std::move(p));
+    }
+    if (cb_) cb_(e, text);
+}
+
+Problem ScannerEngine::take_problem()
+{
+    std::lock_guard<std::mutex> lock(problems_mutex_);
+    if (problems_.empty()) return {};
+    Problem p = std::move(problems_.front());
+    problems_.pop_front();
+    return p;
 }
 
 void ScannerEngine::thread_entry()
 {
     prepare_thread_for_crash_logging("scanner engine");
+    thread_alive_ = true;
+    std::string failure;
     try {
         thread_main();
     } catch (const std::exception& e) {
+        failure = e.what();
         LOG_ERROR("engine: unexpected error ended the scanner thread: %s", e.what());
         log_stack_trace("engine thread stack:");
     } catch (...) {
+        failure = "unknown error";
         LOG_ERROR("engine: unexpected unknown error ended the scanner thread");
     }
+    thread_alive_ = false;
+    connected_ = false;
+    busy_ = false;
+    parking_ = false;
+    {
+        std::lock_guard<std::mutex> lock(progress_.mutex);
+        progress_.active = false;
+    }
+    if (!failure.empty()) post_problem(EngineEvent::EngineStopped, problem_engine_stopped(failure));
     LOG_INFO("engine: scanner thread finished");
 }
 
@@ -225,8 +262,9 @@ void ScannerEngine::thread_main()
         if (job.cmd == Cmd::Quit) break;
         if (job.cmd == Cmd::Connect) {
             LOG_INFO("engine: connect requested");
-            if (!guarded("connect", [this] { do_connect(); }))
-                cb_(EngineEvent::ConnectFailed, "Unexpected error while connecting (see LiDE50Scan.log).");
+            std::string why;
+            if (!guarded("connect", [this] { do_connect(); }, &why))
+                post_problem(EngineEvent::ConnectFailed, problem_unexpected("while connecting to the scanner", why));
         }
         if (job.cmd == Cmd::Disconnect) {
             LOG_INFO("engine: disconnect requested (scanner unplugged)");
@@ -241,11 +279,15 @@ void ScannerEngine::thread_main()
                      r.preview ? "PREVIEW" : "SCAN", r.dpi,
                      r.mode == ColorMode::Color ? "color" : (r.mode == ColorMode::Gray ? "grayscale" : "black & white"),
                      r.tl_x, r.tl_y, r.br_x, r.br_y);
-            bool ok = guarded("scan", [this, &job] { do_scan(job.req); });
+            std::string why;
+            bool out_of_memory = false;
+            bool ok = guarded("scan", [this, &job] { do_scan(job.req); }, &why, &out_of_memory);
             if (!ok) {
                 {
                     std::lock_guard<std::mutex> lock(progress_.mutex);
                     progress_.active = false;
+                    // give the memory back straight away
+                    progress_.image = Image();
                 }
                 if (handle_) guarded("cancel after error", [this] { sane_genesys_cancel(static_cast<SANE_Handle>(handle_)); });
                 bool was_parking = parking_.exchange(false);
@@ -254,8 +296,9 @@ void ScannerEngine::thread_main()
                     // the image was already delivered; only the head return failed
                     cb_(EngineEvent::Idle, "");
                 } else {
-                    cb_(EngineEvent::ScanFailed,
-                        "The scan stopped because of an unexpected error. Details are in LiDE50Scan.log.");
+                    post_problem(EngineEvent::ScanFailed,
+                                 out_of_memory ? problem_not_enough_memory(0, 0, false)
+                                               : problem_unexpected("during the scan", why));
                 }
             }
             parking_ = false;
@@ -270,17 +313,22 @@ void ScannerEngine::thread_main()
 }
 
 template <class F>
-bool ScannerEngine::guarded(const char* what, F&& fn)
+bool ScannerEngine::guarded(const char* what, F&& fn, std::string* why, bool* out_of_memory)
 {
     try {
         fn();
         return true;
     } catch (const std::bad_alloc&) {
         LOG_ERROR("engine: out of memory during %s", what);
+        if (why) *why = "out of memory";
+        if (out_of_memory) *out_of_memory = true;
+        return false;  // no stack trace: it would need memory too
     } catch (const std::exception& e) {
         LOG_ERROR("engine: error during %s: %s", what, e.what());
+        if (why) *why = e.what();
     } catch (...) {
         LOG_ERROR("engine: unknown error during %s", what);
+        if (why) *why = "unknown error";
     }
     log_stack_trace("stack at the time of the error:");
     return false;
@@ -306,12 +354,13 @@ void ScannerEngine::do_connect()
         lide50_enable_simulation();
     }
 
+    lide50_diag_reset_scan();
     SANE_Int version = 0;
     LOG_INFO("engine: starting driver (sane_init)");
     SANE_Status st = sane_genesys_init(&version, nullptr);
     LOG_INFO("engine: sane_init -> %s", status_text(st).c_str());
     if (st != SANE_STATUS_GOOD) {
-        cb_(EngineEvent::ConnectFailed, "Driver initialisation failed: " + status_text(st));
+        post_problem(EngineEvent::ConnectFailed, problem_open_failed(st, lide50_diag_last_error()));
         return;
     }
     sane_inited_ = true;
@@ -319,9 +368,9 @@ void ScannerEngine::do_connect()
     const SANE_Device** list = nullptr;
     st = sane_genesys_get_devices(&list, SANE_TRUE);
     LOG_INFO("engine: sane_get_devices -> %s, %s", status_text(st).c_str(),
-             (list && list[0]) ? list[0]->name : "no scanner found");
-    if (st != SANE_STATUS_GOOD || !list || !list[0]) {
-        cb_(EngineEvent::ConnectFailed, "No Canon LiDE 50 found on USB.");
+             (list && list[0] && list[0]->name) ? list[0]->name : "no scanner found");
+    if (st != SANE_STATUS_GOOD || !list || !list[0] || !list[0]->name) {
+        post_problem(EngineEvent::ConnectFailed, problem_not_connected());
         return;
     }
     std::string name = list[0]->name;
@@ -329,8 +378,8 @@ void ScannerEngine::do_connect()
     LOG_INFO("engine: opening %s", name.c_str());
     st = sane_genesys_open(name.c_str(), &h);
     LOG_INFO("engine: sane_open -> %s", status_text(st).c_str());
-    if (st != SANE_STATUS_GOOD) {
-        cb_(EngineEvent::ConnectFailed, "Could not open the scanner: " + status_text(st));
+    if (st != SANE_STATUS_GOOD || !h) {
+        post_problem(EngineEvent::ConnectFailed, problem_open_failed(st, lide50_diag_last_error()));
         return;
     }
     handle_ = h;
@@ -349,7 +398,10 @@ void ScannerEngine::do_connect()
         auto* d = sane_genesys_get_option_descriptor(h, bry);
         if (d && d->constraint_type == SANE_CONSTRAINT_RANGE) bed_h_ = to_mm(d->constraint.range->max);
     }
-    std::string label = std::string(list[0]->vendor) + " " + list[0]->model;
+    if (!(bed_w_ > 50 && bed_w_ < 400)) bed_w_ = 216.0;
+    if (!(bed_h_ > 50 && bed_h_ < 500)) bed_h_ = 297.0;
+    std::string label = std::string(list[0]->vendor ? list[0]->vendor : "Canon") + " " +
+                        (list[0]->model ? list[0]->model : "LiDE 50");
     if (label.find("LiDE") != std::string::npos) label = "Canon CanoScan LiDE 50";
     if (simulate_) label += " (simulated)";
     if (fake_usb_) label += " (fake USB test device)";
@@ -372,8 +424,9 @@ int ScannerEngine::find_option(const char* name)
     return -1;
 }
 
-bool ScannerEngine::set_option(const char* name, const void* value)
+bool ScannerEngine::set_option(const char* name, const void* value, int* status_out)
 {
+    if (status_out) *status_out = SANE_STATUS_INVAL;
     int idx = find_option(name);
     if (idx < 0) {
         LOG_WARN("engine: option '%s' does not exist", name);
@@ -385,10 +438,9 @@ bool ScannerEngine::set_option(const char* name, const void* value)
         LOG_WARN("engine: option '%s' is not settable right now", name);
         return false;
     }
-    std::vector<char> buf(std::max<size_t>(static_cast<size_t>(d->size), 64));
-    std::memcpy(buf.data(), value, d->type == SANE_TYPE_STRING
-                                       ? std::strlen(static_cast<const char*>(value)) + 1
-                                       : sizeof(SANE_Word));
+    size_t need = d->type == SANE_TYPE_STRING ? std::strlen(static_cast<const char*>(value)) + 1 : sizeof(SANE_Word);
+    std::vector<char> buf(std::max<size_t>({static_cast<size_t>(std::max<SANE_Int>(0, d->size)), need, 64}));
+    std::memcpy(buf.data(), value, need);
     std::string shown;
     if (d->type == SANE_TYPE_STRING) shown = static_cast<const char*>(value);
     else if (d->type == SANE_TYPE_FIXED) shown = std::to_string(SANE_UNFIX(*static_cast<const SANE_Word*>(value)));
@@ -404,6 +456,7 @@ bool ScannerEngine::set_option(const char* name, const void* value)
                  (info & SANE_INFO_INEXACT) ? (" (scanner adjusted it to " + now + ")").c_str() : "");
     else
         LOG_WARN("engine: setting %s = %s failed: %s", name, shown.c_str(), status_text(st).c_str());
+    if (status_out) *status_out = st;
     return st == SANE_STATUS_GOOD;
 }
 
@@ -468,16 +521,78 @@ void ScannerEngine::poll_buttons()
     }
 }
 
+namespace {
+
+// Free memory the scan may use: the commit limit left (RAM plus page file).
+double available_memory_mb(double* physical_mb)
+{
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    if (!GlobalMemoryStatusEx(&ms)) return -1;
+    if (physical_mb) *physical_mb = ms.ullAvailPhys / 1048576.0;
+    return std::min(ms.ullAvailPageFile, ms.ullAvailVirtual) / 1048576.0;
+}
+
+} // namespace
+
+// Looks for results that are almost certainly not what was on the glass.
+void ScannerEngine::check_scan_quality(const Image& img, bool color)
+{
+    if (img.empty()) return;
+    const Lide50CalibReport& cal = *lide50_diag_calib();
+    if (cal.ran && cal.led_result == LIDE50_LED_UNSETTLED && !simulate_) {
+        post_problem(EngineEvent::Warning, warning_led_unsettled(cal));
+        return;
+    }
+    // sample up to ~250,000 pixels
+    const int c = img.channels;
+    const long long px = static_cast<long long>(img.width) * img.height;
+    const int step = std::max(1, static_cast<int>(std::sqrt(static_cast<double>(px) / 250000.0)));
+    double sum[3] = {0, 0, 0}, sq = 0;
+    long long n = 0;
+    for (int y = 0; y < img.height; y += step) {
+        const std::uint8_t* row = img.row(y);
+        for (int x = 0; x < img.width; x += step) {
+            double lum = 0;
+            for (int k = 0; k < c; ++k) {
+                sum[k] += row[x * c + k];
+                lum += row[x * c + k];
+            }
+            lum /= c;
+            sq += lum * lum;
+            ++n;
+        }
+    }
+    if (n == 0) return;
+    double m[3] = {sum[0] / n, c == 3 ? sum[1] / n : sum[0] / n, c == 3 ? sum[2] / n : sum[0] / n};
+    double mean = (m[0] + m[1] + m[2]) / 3.0;
+    double sd = std::sqrt(std::max(0.0, sq / n - mean * mean));
+    LOG_INFO("engine: image check: average R %.1f G %.1f B %.1f, spread %.1f", m[0], m[1], m[2], sd);
+    if (mean < 12 && sd < 6) {
+        post_problem(EngineEvent::Warning, warning_blank(true, mean));
+        return;
+    }
+    if (color && c == 3) {
+        int hi = 0;
+        for (int k = 1; k < 3; ++k) if (m[k] > m[hi]) hi = k;
+        bool others_low = true;
+        for (int k = 0; k < 3; ++k) if (k != hi && m[k] > 0.25 * m[hi]) others_low = false;
+        if (m[hi] > 60 && others_low) post_problem(EngineEvent::Warning, warning_one_colour(hi, m));
+    }
+}
+
 void ScannerEngine::do_scan(const ScanRequest& req)
 {
     if (!connected_) {
         do_connect();
         if (!connected_) {
-            cb_(EngineEvent::ScanFailed, "The scanner is not connected.");
+            // do_connect() already reported why; tell the UI the scan didn't happen
+            post_problem(EngineEvent::ScanFailed, problem_not_connected());
             return;
         }
     }
     auto h = static_cast<SANE_Handle>(handle_);
+    lide50_diag_reset_scan();
 
     // test hook for the crash reporter: LIDE50_CRASH_TEST=1
     if (const char* ct = std::getenv("LIDE50_CRASH_TEST")) {
@@ -493,21 +608,56 @@ void ScannerEngine::do_scan(const ScanRequest& req)
                                                     : SANE_VALUE_SCAN_MODE_GRAY;
     SANE_Word depth = 8;
     SANE_Word dpi = req.dpi;
-    SANE_Word tlx = SANE_FIX(std::clamp(req.tl_x, 0.0, bed_w_));
-    SANE_Word tly = SANE_FIX(std::clamp(req.tl_y, 0.0, bed_h_));
-    SANE_Word brx = SANE_FIX(std::clamp(req.br_x, req.tl_x + 1.0, bed_w_));
-    SANE_Word bry = SANE_FIX(std::clamp(req.br_y, req.tl_y + 1.0, bed_h_));
+    double tl_x = std::clamp(req.tl_x, 0.0, bed_w_ - 1.0), tl_y = std::clamp(req.tl_y, 0.0, bed_h_ - 1.0);
+    double br_x = std::clamp(req.br_x, tl_x + 1.0, bed_w_), br_y = std::clamp(req.br_y, tl_y + 1.0, bed_h_);
+    SANE_Word tlx = SANE_FIX(tl_x), tly = SANE_FIX(tl_y), brx = SANE_FIX(br_x), bry = SANE_FIX(br_y);
     SANE_Bool preview = SANE_FALSE; // full-quality preview; resolution is already low
 
-    set_option(SANE_NAME_SCAN_MODE, mode);
-    set_option(SANE_NAME_BIT_DEPTH, &depth);
-    set_option(SANE_NAME_SCAN_RESOLUTION, &dpi);
-    set_option(SANE_NAME_PREVIEW, &preview);
-    // order matters: set bottom-right first so top-left is always valid
-    set_option(SANE_NAME_SCAN_BR_X, &brx);
-    set_option(SANE_NAME_SCAN_BR_Y, &bry);
-    set_option(SANE_NAME_SCAN_TL_X, &tlx);
-    set_option(SANE_NAME_SCAN_TL_Y, &tly);
+    // memory check before anything moves
+    {
+        double w_px = (br_x - tl_x) / 25.4 * req.dpi, h_px = (br_y - tl_y) / 25.4 * req.dpi;
+        double need_mb = w_px * h_px * (req.mode == ColorMode::Color ? 3 : 1) / 1048576.0 * 1.15 + 64;
+        double phys = 0, avail = available_memory_mb(&phys);
+        LOG_INFO("engine: scan needs about %.0f MB; %.0f MB available (%.0f MB of it free RAM)", need_mb, avail, phys);
+        if (avail > 0 && need_mb > avail) {
+            post_problem(EngineEvent::ScanFailed, problem_not_enough_memory(need_mb, avail, true));
+            return;
+        }
+    }
+
+    // settings that change what is scanned must be accepted, or the result would be wrong
+    struct Opt { const char* name; const void* value; bool required; };
+    const Opt opts[] = {
+        {SANE_NAME_SCAN_MODE, mode, true},
+        {SANE_NAME_BIT_DEPTH, &depth, true},
+        {SANE_NAME_SCAN_RESOLUTION, &dpi, true},
+        {SANE_NAME_PREVIEW, &preview, false},
+        // order matters: set bottom-right first so top-left is always valid
+        {SANE_NAME_SCAN_BR_X, &brx, true},
+        {SANE_NAME_SCAN_BR_Y, &bry, true},
+        {SANE_NAME_SCAN_TL_X, &tlx, true},
+        {SANE_NAME_SCAN_TL_Y, &tly, true},
+    };
+    for (const Opt& o : opts) {
+        int ost = 0;
+        if (!set_option(o.name, o.value, &ost) && o.required) {
+            post_problem(EngineEvent::ScanFailed, problem_scan_settings(o.name, ost));
+            return;
+        }
+    }
+    // in gray mode use all three lamp colours (white light), never a single colour filter
+    if (req.mode != ColorMode::Color) {
+        int fi = find_option("color-filter");
+        auto* fd = fi > 0 ? sane_genesys_get_option_descriptor(h, fi) : nullptr;
+        if (fd && SANE_OPTION_IS_ACTIVE(fd->cap) && fd->constraint_type == SANE_CONSTRAINT_STRING_LIST &&
+            fd->constraint.string_list) {
+            for (int k = 0; fd->constraint.string_list[k]; ++k)
+                if (std::strcmp(fd->constraint.string_list[k], "None") == 0) {
+                    set_option("color-filter", "None");
+                    break;
+                }
+        }
+    }
 
     cb_(EngineEvent::Status, req.preview ? "Warming up lamp and calibrating for preview..."
                                          : "Warming up lamp and calibrating...");
@@ -519,11 +669,27 @@ void ScannerEngine::do_scan(const ScanRequest& req)
                                           std::chrono::steady_clock::now() - t).count());
     };
     LOG_INFO("engine: sane_start -> %s after %lld ms", status_text(st).c_str(), ms_since(t_start));
+    {
+        const Lide50CalibReport& c = *lide50_diag_calib();
+        if (c.ran)
+            LOG_INFO("engine: calibration: LED %s after %d tries, brightness %u/%u/%u (target %u), exposure "
+                     "%u/%u/%u, white strip %u/%u/%u%s%s",
+                     c.led_result == LIDE50_LED_OK ? "settled" : c.led_result == LIDE50_LED_UNSETTLED ? "DID NOT SETTLE" : "not run",
+                     c.led_tries, c.led_average[0], c.led_average[1], c.led_average[2], c.led_target,
+                     c.led_exposure[0], c.led_exposure[1], c.led_exposure[2], c.white_level[0], c.white_level[1],
+                     c.white_level[2], c.reset_bad_exposure ? ", reset an out-of-range exposure" : "",
+                     c.cache_rejected ? ", ignored an invalid cached calibration" : "");
+    }
     if (st != SANE_STATUS_GOOD) {
-        sane_genesys_cancel(h);
+        std::string drv = lide50_diag_last_error();
+        guarded("cancel after failed start", [h] { sane_genesys_cancel(h); });
         if (st == SANE_STATUS_IO_ERROR || st == SANE_STATUS_ACCESS_DENIED) do_close();
         busy_ = false;
-        cb_(EngineEvent::ScanFailed, "Could not start the scan: " + status_text(st));
+        if (st == SANE_STATUS_CANCELLED) {
+            cb_(EngineEvent::ScanCancelled, "");
+            return;
+        }
+        post_problem(EngineEvent::ScanFailed, problem_scan_start(st, drv, *lide50_diag_calib()));
         return;
     }
     SANE_Parameters p{};
@@ -531,16 +697,14 @@ void ScannerEngine::do_scan(const ScanRequest& req)
     LOG_INFO("engine: parameters (%s): format %d (%s), %d pixels x %d lines, %d bytes/line, depth %d",
              status_text(pst).c_str(), p.format, p.format == SANE_FRAME_RGB ? "RGB" : (p.format == SANE_FRAME_GRAY ? "gray" : "other"),
              p.pixels_per_line, p.lines, p.bytes_per_line, p.depth);
-    if (p.pixels_per_line <= 0 || p.bytes_per_line <= 0 ||
+    if (pst != SANE_STATUS_GOOD || p.pixels_per_line <= 0 || p.pixels_per_line > 100000 || p.bytes_per_line <= 0 ||
+        p.lines > 200000 || p.depth != 8 || (p.format != SANE_FRAME_RGB && p.format != SANE_FRAME_GRAY) ||
         p.bytes_per_line != p.pixels_per_line * (p.format == SANE_FRAME_RGB ? 3 : 1)) {
-        sane_genesys_cancel(h);
-        LOG_ERROR("engine: the scanner reported an invalid line size");
-        cb_(EngineEvent::ScanFailed, "The scanner reported an invalid image size.");
-        return;
-    }
-    if (p.depth != 8 || (p.format != SANE_FRAME_RGB && p.format != SANE_FRAME_GRAY)) {
-        sane_genesys_cancel(h);
-        cb_(EngineEvent::ScanFailed, "Unexpected image format from scanner.");
+        guarded("cancel after bad parameters", [h] { sane_genesys_cancel(h); });
+        char d[200];
+        std::snprintf(d, sizeof(d), "status %s, format %d, %d pixels x %d lines, %d bytes per line, depth %d",
+                      status_text(pst).c_str(), p.format, p.pixels_per_line, p.lines, p.bytes_per_line, p.depth);
+        post_problem(EngineEvent::ScanFailed, problem_bad_image_format(d));
         return;
     }
     const int channels = p.format == SANE_FRAME_RGB ? 3 : 1;
@@ -551,7 +715,17 @@ void ScannerEngine::do_scan(const ScanRequest& req)
     {
         std::lock_guard<std::mutex> lock(progress_.mutex);
         progress_.image = Image();
-        progress_.image.alloc(width, expected, channels);
+        try {
+            progress_.image.alloc(width, expected, channels);
+        } catch (const std::bad_alloc&) {
+            progress_.image = Image();
+            guarded("cancel after out of memory", [h] { sane_genesys_cancel(h); });
+            double phys = 0, avail = available_memory_mb(&phys);
+            post_problem(EngineEvent::ScanFailed,
+                         problem_not_enough_memory(static_cast<double>(width) * expected * channels / 1048576.0,
+                                                   avail, true));
+            return;
+        }
         progress_.image.dpi = req.dpi;
         std::fill(progress_.image.data.begin(), progress_.image.data.end(), 255);
         progress_.lines_done = 0;
@@ -567,7 +741,10 @@ void ScannerEngine::do_scan(const ScanRequest& req)
     size_t line_fill = 0;
     int lines = 0;
     bool cancelled = false;
+    bool out_of_memory = false;
     std::string error;
+    std::string driver_error;
+    SANE_Status read_status = SANE_STATUS_GOOD;
     const double mm_per_px = 25.4 / req.dpi;
     auto sim_last = std::chrono::steady_clock::now();
     int sim_lines_paced = 0;
@@ -577,16 +754,18 @@ void ScannerEngine::do_scan(const ScanRequest& req)
     int next_report = 10;
     bool delivered = false;   // image handed to the UI before the head finished parking
 
-    // Hands the finished image to the UI.
+    // Hands the finished image to the UI (moved, not copied: a 2400 dpi scan is over 1 GB).
     auto deliver = [&](const std::string& note) {
         Image out;
         {
             std::lock_guard<std::mutex> lock(progress_.mutex);
-            out = progress_.image;
+            out = std::move(progress_.image);
+            progress_.image = Image();
             progress_.active = false;
         }
-        out.height = lines;
-        out.data.resize(static_cast<size_t>(lines) * out.stride());
+        out.height = std::min(out.height, lines);
+        out.data.resize(static_cast<size_t>(out.height) * out.stride());
+        out.data.shrink_to_fit();
         out.dpi = req.dpi;
         const int ow = out.width, oh = out.height;
         {
@@ -595,6 +774,23 @@ void ScannerEngine::do_scan(const ScanRequest& req)
         }
         LOG_INFO("engine: scan complete: %d x %d pixels", ow, oh);
         cb_(EngineEvent::ScanFinished, note);
+    };
+    // a small copy of every n-th row, for the quality check (the full image goes to the UI)
+    auto sample_rows = [&](int nlines) -> Image {
+        Image sample;
+        std::lock_guard<std::mutex> lock(progress_.mutex);
+        const Image& src = progress_.image;
+        const int hgt = std::min(src.height, nlines);
+        if (src.empty() || hgt <= 0) return sample;
+        const int step = std::max(1, hgt / 300);
+        try {
+            sample.alloc(src.width, (hgt + step - 1) / step, src.channels);
+        } catch (const std::bad_alloc&) {
+            return Image();
+        }
+        for (int y = 0, sy = 0; sy < sample.height && y < hgt; y += step, ++sy)
+            std::memcpy(sample.row(sy), src.row(y), sample.stride());
+        return sample;
     };
 
     LOG_INFO("engine: reading image data");
@@ -611,12 +807,15 @@ void ScannerEngine::do_scan(const ScanRequest& req)
             break;
         }
         if (st != SANE_STATUS_GOOD) {
+            read_status = st;
             error = status_text(st);
-            LOG_ERROR("engine: sane_read failed after %d lines: %s", lines, error.c_str());
+            driver_error = lide50_diag_last_error();
+            LOG_ERROR("engine: sane_read failed after %d lines: %s (%s)", lines, error.c_str(), driver_error.c_str());
             break;
         }
         if (got < 0 || got > static_cast<SANE_Int>(chunk.size())) {
             error = "invalid data length from driver";
+            read_status = SANE_STATUS_INVAL;
             LOG_ERROR("engine: driver returned an invalid length %d", got);
             break;
         }
@@ -634,6 +833,7 @@ void ScannerEngine::do_scan(const ScanRequest& req)
             off += n;
             if (line_fill == static_cast<size_t>(bpl)) {
                 line_fill = 0;
+                if (delivered) continue;  // data after the last line (should not happen); ignore it
                 if (simulate_) {
                     // replace the virtual device's blank output with a test pattern
                     double y = req.tl_y + lines * mm_per_px;
@@ -647,14 +847,24 @@ void ScannerEngine::do_scan(const ScanRequest& req)
                 std::lock_guard<std::mutex> lock(progress_.mutex);
                 Image& img = progress_.image;
                 if (lines >= img.height) {
-                    int nh = img.height * 2;
-                    img.data.resize(static_cast<size_t>(nh) * img.stride(), 255);
+                    // the driver didn't say how many lines there are: grow the image
+                    int nh = std::max(img.height * 2, 64);
+                    try {
+                        img.data.resize(static_cast<size_t>(nh) * img.stride(), 255);
+                    } catch (const std::bad_alloc&) {
+                        out_of_memory = true;
+                        break;
+                    }
                     img.height = nh;
                 }
                 std::memcpy(img.row(lines), line.data(), img.stride());
                 ++lines;
                 progress_.lines_done = lines;
             }
+        }
+        if (out_of_memory) {
+            LOG_ERROR("engine: out of memory after %d lines", lines);
+            break;
         }
         if (!delivered && p.lines > 0 && lines >= p.lines) {
             // All image lines are in. The driver's next read returns the scan head to the
@@ -663,7 +873,9 @@ void ScannerEngine::do_scan(const ScanRequest& req)
             LOG_INFO("engine: all %d lines received in %lld ms; returning the scan head", lines, ms_since(t_start));
             delivered = true;
             parking_ = true;
+            Image sample = sample_rows(lines);
             deliver("");
+            check_scan_quality(sample, req.mode == ColorMode::Color);
             cb_(EngineEvent::Parking, "Returning the scan head");
             if (simulate_ || fake_usb_) {
                 // test hook: LIDE50_TEST_PARK_MS imitates the real head-return time
@@ -681,7 +893,7 @@ void ScannerEngine::do_scan(const ScanRequest& req)
         }
     }
     LOG_INFO("engine: finishing scan (sane_cancel: parking head)");
-    sane_genesys_cancel(h);
+    guarded("finish scan", [h] { sane_genesys_cancel(h); });
     LOG_INFO("engine: received %d lines, %llu bytes in %lld ms", lines, total_bytes, ms_since(t_start));
 
     if (delivered) {
@@ -690,7 +902,8 @@ void ScannerEngine::do_scan(const ScanRequest& req)
         if (!error.empty()) {
             LOG_WARN("engine: returning the scan head reported an error (the image is complete): %s",
                      error.c_str());
-            if (st == SANE_STATUS_IO_ERROR) do_close();
+            if (read_status == SANE_STATUS_IO_ERROR) do_close();
+            post_problem(EngineEvent::Warning, warning_head_return(read_status, driver_error));
         } else {
             LOG_INFO("engine: scan head parked, ready");
         }
@@ -699,20 +912,50 @@ void ScannerEngine::do_scan(const ScanRequest& req)
         return;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(progress_.mutex);
-        progress_.active = false;
-    }
-    busy_ = false;
     if (cancelled) {
+        {
+            std::lock_guard<std::mutex> lock(progress_.mutex);
+            progress_.active = false;
+            progress_.image = Image();
+        }
+        busy_ = false;
         cb_(EngineEvent::ScanCancelled, "");
         return;
     }
-    if (!error.empty() && lines == 0) {
-        if (st == SANE_STATUS_IO_ERROR) do_close();
-        cb_(EngineEvent::ScanFailed, "Scan failed: " + error);
+    if (out_of_memory) {
+        {
+            std::lock_guard<std::mutex> lock(progress_.mutex);
+            progress_.active = false;
+            progress_.image = Image();
+        }
+        busy_ = false;
+        double phys = 0, avail = available_memory_mb(&phys);
+        post_problem(EngineEvent::ScanFailed, problem_not_enough_memory(0, avail, false));
         return;
     }
-    deliver(error.empty() ? "" : "Scan ended early: " + error);
+    if (!error.empty() && lines == 0) {
+        {
+            std::lock_guard<std::mutex> lock(progress_.mutex);
+            progress_.active = false;
+            progress_.image = Image();
+        }
+        busy_ = false;
+        if (read_status == SANE_STATUS_IO_ERROR) do_close();
+        post_problem(EngineEvent::ScanFailed, problem_scan_read(read_status, driver_error, 0, p.lines));
+        return;
+    }
+    // a scan that ended early (or a driver that didn't announce the line count) keeps what arrived
+    Image sample = sample_rows(lines);
+    busy_ = false;
+    deliver(error.empty() ? "" : "ended early");
+    if (!error.empty()) {
+        if (read_status == SANE_STATUS_IO_ERROR) do_close();
+        Problem pr = problem_scan_read(read_status, driver_error, lines, p.lines);
+        pr.warning = true;
+        pr.what += L" The part that was scanned has been kept.";
+        post_problem(EngineEvent::Warning, std::move(pr));
+    } else {
+        check_scan_quality(sample, req.mode == ColorMode::Color);
+    }
     cb_(EngineEvent::Idle, "");
 }

@@ -17,8 +17,13 @@ const wchar_t* format_filter(OutFormat f);             // file dialog filter (do
 bool format_multipage(OutFormat f);                    // PDF, DOCX, TIFF hold several pages
 
 // Writes all pages into one file (multi-page formats) or the first page.
+// The file is written under a temporary name first and only replaces an existing file
+// once it is complete, so a failed save never damages the old file.
+// On failure `error` describes it and `win32_error` (if given) holds the Windows error code;
+// `needed_mb`/`free_mb` are set when the disk is too full.
 bool write_document(const std::wstring& path, OutFormat f, const std::vector<const Image*>& pages,
-                    const SaveOptions& opt, std::wstring& error);
+                    const SaveOptions& opt, std::wstring& error, unsigned long* win32_error = nullptr,
+                    double* needed_mb = nullptr, double* free_mb = nullptr);
 
 // Encoders exposed for tests.
 std::vector<unsigned char> encode_png(const Image& img);

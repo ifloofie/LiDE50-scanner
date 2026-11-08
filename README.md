@@ -34,6 +34,8 @@ On first use, the app asks Windows once for permission and assigns Windows' own 
 - The scanner's own buttons start a scan.
 - A glass-style interface with light and dark mode.
 - Fully portable: settings and calibration are stored next to the exe.
+- Problems are explained in plain language with numbered steps to fix them, a
+  one-click fix where there is one, and "Copy details" for bug reports.
 - An activity log (`LiDE50Scan.log`) next to the exe, with crash reports.
   Run `LiDE50Scan.exe --log` for a full USB trace.
 

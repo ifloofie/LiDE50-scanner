@@ -21,6 +21,7 @@
 #ifndef BACKEND_GENESYS_ERROR_H
 #define BACKEND_GENESYS_ERROR_H
 
+#include "lide50_diag.h"
 #include "../include/sane/config.h"
 #include "../include/sane/sane.h"
 #include "../include/sane/sanei_backend.h"
@@ -135,16 +136,20 @@ SANE_Status wrap_exceptions_to_status_code(const char* func, F&& function)
         return SANE_STATUS_GOOD;
     } catch (const SaneException& exc) {
         DBG(DBG_error, "%s: got error: %s\n", func, exc.what());
+        lide50_diag_note_error(func, exc.what());
         return exc.status();
     } catch (const std::bad_alloc& exc) {
         (void) exc;
         DBG(DBG_error, "%s: failed to allocate memory\n", func);
+        lide50_diag_note_error(func, "out of memory");
         return SANE_STATUS_NO_MEM;
     } catch (const std::exception& exc) {
         DBG(DBG_error, "%s: got uncaught exception: %s\n", func, exc.what());
+        lide50_diag_note_error(func, exc.what());
         return SANE_STATUS_INVAL;
     } catch (...) {
         DBG(DBG_error, "%s: got unknown uncaught exception\n", func);
+        lide50_diag_note_error(func, "unknown error");
         return SANE_STATUS_INVAL;
     }
 }
@@ -156,16 +161,20 @@ SANE_Status wrap_exceptions_to_status_code_return(const char* func, F&& function
         return function();
     } catch (const SaneException& exc) {
         DBG(DBG_error, "%s: got error: %s\n", func, exc.what());
+        lide50_diag_note_error(func, exc.what());
         return exc.status();
     } catch (const std::bad_alloc& exc) {
         (void) exc;
         DBG(DBG_error, "%s: failed to allocate memory\n", func);
+        lide50_diag_note_error(func, "out of memory");
         return SANE_STATUS_NO_MEM;
     } catch (const std::exception& exc) {
         DBG(DBG_error, "%s: got uncaught exception: %s\n", func, exc.what());
+        lide50_diag_note_error(func, exc.what());
         return SANE_STATUS_INVAL;
     } catch (...) {
         DBG(DBG_error, "%s: got unknown uncaught exception\n", func);
+        lide50_diag_note_error(func, "unknown error");
         return SANE_STATUS_INVAL;
     }
 }

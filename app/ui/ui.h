@@ -7,6 +7,7 @@
 
 #include "gfx.h"
 
+#include <deque>
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -110,6 +111,21 @@ public:
     void toast(const std::wstring& text, int kind = 0); // 0 info, 1 success, 2 warning
     void alert(const std::wstring& title, const std::wstring& message, std::vector<std::wstring> buttons,
                std::function<void(int)> on_close, int default_button = 0, int cancel_button = -1);
+    // An alert with numbered steps and a small footer line (used for problems). `on_click` runs
+    // after the frame; buttons listed in `keep_open` don't close the alert (e.g. "Copy details").
+    struct AlertSpec {
+        std::wstring title, message;
+        std::vector<std::wstring> steps;
+        std::wstring footer;
+        std::vector<std::wstring> buttons;
+        std::vector<int> keep_open;
+        std::function<void(int)> on_click;
+        int def = 0, cancel = -1;
+        bool warning = false;     // amber accent instead of red
+        bool problem = false;     // draw the status icon next to the title
+    };
+    void alert(AlertSpec spec);
+    int queued_alerts() const { return static_cast<int>(queue_.size()); }
     bool popover_open() const { return pop_.open; }
     void close_popover() { pop_.open = false; }
 
@@ -158,10 +174,9 @@ private:
 
     struct Alert {
         bool open = false;
-        std::wstring title, message;
-        std::vector<std::wstring> buttons;
-        std::function<void(int)> on_close;
-        int def = 0, cancel = -1;
+        AlertSpec spec;
     } alert_, alert_draw_;
+    std::deque<AlertSpec> queue_;      // alerts waiting for the open one to close
     float alert_anim_ = 0;
+    float alert_scroll_ = 0;
 };

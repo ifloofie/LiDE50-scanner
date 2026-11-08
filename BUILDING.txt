@@ -19,3 +19,15 @@ Layout
 
 Run "LiDE50Scan.exe --simulate" to exercise the complete driver code path against
 the backend's virtual LiDE 50 (no hardware needed), and "--log" for a USB trace.
+
+"--fake-usb" runs the real-hardware driver path against a fake GL841 chip
+(core/shim/sanei_win.cpp). Its sensor follows the LED exposure registers like the
+real one. Test settings (environment variables):
+  LIDE50_FAKE_LED=<r>,<g>,<b>   brightness per exposure unit (default 24,24,24;
+                                24,24,0 = dead blue LED; "flat" = ignore exposure)
+  LIDE50_FAKE_AMBIENT=<n>       stray light added to every colour (50000 = lid open)
+  LIDE50_FAKE_DATA=<0..255>     every byte constant (0 = no light at all)
+  LIDE50_FAKE_FAIL_AT=<n>       the n-th bulk read fails (USB error)
+  LIDE50_FAKE_AWAY=<n>          head reports "away from home" for n status reads
+  LIDE50_TEST_PARK_MS=<ms>      imitate the head-return time
+  LIDE50_CRASH_TEST=1           crash on purpose (tests the crash report)

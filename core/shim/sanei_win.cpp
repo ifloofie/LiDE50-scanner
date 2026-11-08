@@ -20,6 +20,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -126,14 +127,37 @@ struct FakeGl841 {
         }
     }
 
+    // light model state: bytes delivered since the last scan/move start
+    unsigned long long stream_pos = 0;
+
+    // Register snapshot at every scan/move start (test log)
+    void snapshot(const char* what)
+    {
+        stream_pos = 0;
+        usb_log("FAKECHIP", "%s: r01=%02x r02=%02x r03=%02x r04=%02x exp R=%02x%02x G=%02x%02x B=%02x%02x "
+                "r19=%02x lperiod=%02x%02x dpiset=%02x%02x r67=%02x r68=%02x r6c=%02x r87=%02x "
+                "lincnt=%02x%02x%02x feedl=%02x%02x%02x", what,
+                regs[0x01], regs[0x02], regs[0x03], regs[0x04], regs[0x10], regs[0x11], regs[0x12], regs[0x13],
+                regs[0x14], regs[0x15], regs[0x19], regs[0x38], regs[0x39], regs[0x2c], regs[0x2d],
+                regs[0x67], regs[0x68], regs[0x6c], regs[0x87], regs[0x25], regs[0x26], regs[0x27],
+                regs[0x3d], regs[0x3e], regs[0x3f]);
+    }
+
     void control(int rtype, int req, int value, int len, unsigned char* data)
     {
         const bool in = (rtype & 0x80) != 0;
         if (!in && req == 0x0c && value == 0x83 && len >= 1) cur = data[0];
-        else if (!in && req == 0x0c && value == 0x85 && len >= 1) regs[cur] = data[0];
+        else if (!in && req == 0x0c && value == 0x85 && len >= 1) {
+            regs[cur] = data[0];
+            if (cur == 0x0f && (data[0] & 0x01)) snapshot("start");
+        }
         else if (in && req == 0x0c && value == 0x84 && len >= 1) data[0] = read(cur);
         else if (!in && req == 0x04 && value == 0x83) {
-            for (int i = 0; i + 1 < len; i += 2) regs[data[i]] = data[i + 1];
+            for (int i = 0; i + 1 < len; i += 2) {
+                regs[data[i]] = data[i + 1];
+            }
+            for (int i = 0; i + 1 < len; i += 2)
+                if (data[i] == 0x0f && (data[i + 1] & 0x01)) snapshot("start(bulk)");
         } else if (!in && req == 0x04 && value == 0x82 && len >= 8) {
             size_t size = data[4] | (data[5] << 8) | (data[6] << 16) | (static_cast<size_t>(data[7]) << 24);
             if (data[0] == 0x00) pending_in = size; // BULK_IN
@@ -142,9 +166,43 @@ struct FakeGl841 {
         }
     }
 
+    // Light model. Each colour's brightness grows with its LED exposure register, like the
+    // real CIS sensor: level16 = dark + ambient + k[colour] * exposure. Test settings:
+    //   LIDE50_FAKE_LED=<kr>,<kg>,<kb>  brightness per exposure unit (default 24,24,24; the
+    //                                   driver's 0x400 default then reads about 24,600 of 25,600)
+    //   LIDE50_FAKE_LED=flat            old behaviour: brightness ignores the exposure
+    //   LIDE50_FAKE_AMBIENT=<0..65535>  stray light added to every colour (lid open)
+    struct LightModel {
+        bool flat = false;
+        double k[3] = {24.0, 24.0, 24.0};
+        double ambient = 0;
+        LightModel()
+        {
+            if (const char* e = std::getenv("LIDE50_FAKE_LED")) {
+                if (std::strcmp(e, "flat") == 0) flat = true;
+                else std::sscanf(e, "%lf,%lf,%lf", &k[0], &k[1], &k[2]);
+            }
+            if (const char* e = std::getenv("LIDE50_FAKE_AMBIENT")) ambient = std::atof(e);
+        }
+    };
+
+    unsigned exposure(int colour) const
+    {
+        return (static_cast<unsigned>(regs[0x10 + colour * 2]) << 8) | regs[0x11 + colour * 2];
+    }
+
+    // 16-bit level for one colour (0 R, 1 G, 2 B, 3 = all LEDs added for gray)
+    double level16(const LightModel& m, int colour) const
+    {
+        const double dark = 600;
+        double light = 0;
+        if (colour == 3) light = (m.k[0] * exposure(0) + m.k[1] * exposure(1) + m.k[2] * exposure(2)) / 3.0;
+        else light = m.k[colour] * exposure(colour);
+        return std::min(65535.0, dark + m.ambient + light);
+    }
+
     void bulk_read(unsigned char* buf, size_t& size)
     {
-        // plausible sensor data: bright paper with some noise
         // (LIDE50_FAKE_DATA=<0..255> forces a constant value for robustness tests)
         static int forced = [] {
             const char* e = std::getenv("LIDE50_FAKE_DATA");
@@ -155,9 +213,43 @@ struct FakeGl841 {
             pending_in = pending_in > size ? pending_in - size : 0;
             return;
         }
-        for (size_t i = 0; i < size; ++i) {
+        static const LightModel model;
+        if (model.flat) {
+            // plausible sensor data: bright paper with some noise
+            for (size_t i = 0; i < size; ++i) {
+                seed = seed * 1103515245u + 12345u;
+                buf[i] = static_cast<unsigned char>(0xb0 + ((seed >> 16) & 0x1f));
+            }
+            pending_in = pending_in > size ? pending_in - size : 0;
+            return;
+        }
+        const bool depth16 = (regs[0x04] & 0x40) != 0;
+        const int filter = (regs[0x04] >> 2) & 3;          // 0 none, 1 red, 2 green, 3 blue
+        const bool ledadd = (regs[0x87] & 0x04) != 0;
+        const bool cycle = filter == 0 && !ledadd;         // CIS colour: R, G, B lines in turn
+        unsigned long long line_bytes = (static_cast<unsigned>(regs[0x35]) << 16) |
+                                        (static_cast<unsigned>(regs[0x36]) << 8) | regs[0x37];
+        if (cycle) line_bytes /= 3;
+        if (line_bytes == 0) line_bytes = 1;
+        // the 8-bit scan level is scaled so the driver's default exposure gives "paper" (~0xc0)
+        const double target16 = 25600.0;
+        size_t i = 0;
+        while (i < size) {
+            unsigned long long line = stream_pos / line_bytes;
+            int colour = ledadd ? 3 : (filter ? filter - 1 : static_cast<int>(line % 3));
+            double lv = level16(model, colour);
             seed = seed * 1103515245u + 12345u;
-            buf[i] = static_cast<unsigned char>(0xb0 + ((seed >> 16) & 0x1f));
+            double noise = 1.0 + (static_cast<int>((seed >> 16) & 0x3f) - 32) / 1600.0;
+            if (depth16) {
+                unsigned v = static_cast<unsigned>(std::clamp(lv * noise, 0.0, 65535.0));
+                // little-endian 16-bit words; keep word alignment within the stream
+                buf[i] = static_cast<unsigned char>((stream_pos & 1) ? (v >> 8) : (v & 0xff));
+            } else {
+                double v8 = 0xc0 * std::min(1.4, lv / target16) * noise;
+                buf[i] = static_cast<unsigned char>(std::clamp(v8, 0.0, 255.0));
+            }
+            ++i;
+            ++stream_pos;
         }
         pending_in = pending_in > size ? pending_in - size : 0;
     }

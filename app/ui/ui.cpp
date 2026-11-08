@@ -539,14 +539,34 @@ void Ui::toast(const std::wstring& text, int kind)
 void Ui::alert(const std::wstring& title, const std::wstring& message, std::vector<std::wstring> buttons,
                std::function<void(int)> on_close, int default_button, int cancel_button)
 {
-    alert_.open = true;
-    alert_.title = title;
-    alert_.message = message;
-    alert_.buttons = buttons.empty() ? std::vector<std::wstring>{L"OK"} : std::move(buttons);
-    alert_.on_close = std::move(on_close);
-    alert_.def = default_button;
-    alert_.cancel = cancel_button;
+    AlertSpec spec;
+    spec.title = title;
+    spec.message = message;
+    spec.buttons = std::move(buttons);
+    spec.on_click = std::move(on_close);
+    spec.def = default_button;
+    spec.cancel = cancel_button;
+    alert(std::move(spec));
+}
+
+void Ui::alert(AlertSpec spec)
+{
+    if (spec.buttons.empty()) spec.buttons = {L"OK"};
+    spec.def = std::clamp(spec.def, 0, static_cast<int>(spec.buttons.size()) - 1);
+    if (spec.cancel >= static_cast<int>(spec.buttons.size())) spec.cancel = -1;
     want_frame_ = true;
+    if (alert_.open) {
+        // don't replace an alert the user hasn't answered; show this one next
+        // (an identical one already waiting is not added twice)
+        for (const auto& q : queue_)
+            if (q.title == spec.title && q.message == spec.message) return;
+        if (alert_.spec.title == spec.title && alert_.spec.message == spec.message) return;
+        if (queue_.size() < 8) queue_.push_back(std::move(spec));
+        return;
+    }
+    alert_.open = true;
+    alert_.spec = std::move(spec);
+    alert_scroll_ = 0;
 }
 
 // --------------------------------------------------------------- overlays
@@ -655,23 +675,105 @@ void Ui::draw_toasts()
 
 void Ui::draw_alert()
 {
+    if (!alert_.open && !queue_.empty() && alert_anim_ < 0.05f) {
+        alert_.open = true;
+        alert_.spec = std::move(queue_.front());
+        queue_.pop_front();
+        alert_scroll_ = 0;
+    }
     if (alert_.open) alert_draw_ = alert_;
     alert_anim_ = anim("__alert", alert_.open ? 1.0f : 0.0f, 16.0f);
     if (alert_anim_ < 0.01f) return;
-    const Alert& al = alert_draw_;
+    const AlertSpec& al = alert_draw_.spec;
     float a = alert_anim_;
     g.push_opacity(a);
     g.fill_rect(RectF{0, 0, g.width(), g.height()}, t.dim);
-    float w = std::min(420.0f, g.width() - 40.0f);
-    float msg_h = g.text_height(al.message, 13.0f, 400, w - 48.0f);
-    float h = 24.0f + 26.0f + 8.0f + msg_h + 24.0f + 36.0f + 22.0f;
+
+    const bool rich = !al.steps.empty() || al.problem;
+    float w = std::min(rich ? 520.0f : 420.0f, g.width() - 40.0f);
+    const float pad = 24.0f, inner = w - 2 * pad;
+    const float title_x = al.problem ? 38.0f : 0.0f;
+    const float step_indent = 30.0f;
+
+    // content height (everything between the title and the buttons)
+    float title_h = std::max(26.0f, g.text_height(al.title, 17.0f, 600, inner - title_x));
+    float msg_h = al.message.empty() ? 0.0f : g.text_height(al.message, 13.0f, 400, inner);
+    std::vector<float> step_h;
+    float steps_h = 0;
+    for (const auto& st : al.steps) {
+        float h = std::max(22.0f, g.text_height(st, 13.0f, 400, inner - step_indent));
+        step_h.push_back(h);
+        steps_h += h + 8.0f;
+    }
+    if (!al.steps.empty()) steps_h += 30.0f;  // "What to try" heading
+    float footer_h = al.footer.empty() ? 0.0f : g.text_height(al.footer, 11.5f, 400, inner) + 10.0f;
+    float content_h = msg_h + steps_h + footer_h;
+
+    const float fixed_h = pad + title_h + 10.0f + 20.0f + 36.0f + 22.0f;
+    float max_h = std::max(200.0f, g.height() - 40.0f);
+    float view_h = std::min(content_h, max_h - fixed_h);
+    float h = fixed_h + view_h;
+    float max_scroll = std::max(0.0f, content_h - view_h);
+    if (alert_.open && wheel != 0 && max_scroll > 0) {
+        alert_scroll_ = std::clamp(alert_scroll_ - wheel * 60.0f, 0.0f, max_scroll);
+        wheel = 0;
+    }
+    alert_scroll_ = std::clamp(alert_scroll_, 0.0f, max_scroll);
+
     float sc = 0.92f + 0.08f * a;
     RectF r{g.width() * 0.5f - w * 0.5f, g.height() * 0.5f - h * 0.5f, w, h};
     g.set_transform(D2D1::Matrix3x2F::Scale(sc, sc, D2D1::Point2F(r.cx(), r.cy())));
     glass_overlay(r, 22.0f, 2.0f);
-    g.text(al.title, RectF{r.x + 24.0f, r.y + 24.0f, w - 48.0f, 26.0f}, 17.0f, 600, t.text, Align::Start, Align::Center);
-    g.text(al.message, RectF{r.x + 24.0f, r.y + 58.0f, w - 48.0f, msg_h + 4.0f}, 13.0f, 400, t.text2, Align::Start,
-           Align::Start, true);
+
+    Color tone = al.warning ? t.warning : t.danger;
+    if (al.problem) {
+        float cy = r.y + pad + 13.0f;
+        g.fill_ellipse(r.x + pad + 13.0f, cy, 13.0f, 13.0f, tone.alpha(0.16f));
+        g.text(L"!", RectF{r.x + pad, cy - 13.0f, 26.0f, 26.0f}, 16.0f, 700, tone, Align::Center, Align::Center);
+    }
+    g.text(al.title, RectF{r.x + pad + title_x, r.y + pad, inner - title_x, title_h}, 17.0f, 600, t.text,
+           Align::Start, Align::Center, true);
+
+    RectF view{r.x + pad, r.y + pad + title_h + 10.0f, inner, view_h};
+    g.push_clip(view);
+    float y = view.y - alert_scroll_;
+    if (!al.message.empty()) {
+        g.text(al.message, RectF{view.x, y, inner, msg_h + 4.0f}, 13.0f, 400, t.text2, Align::Start, Align::Start,
+               true);
+        y += msg_h;
+    }
+    if (!al.steps.empty()) {
+        y += 12.0f;
+        g.text(L"What to try", RectF{view.x, y, inner, 18.0f}, 12.0f, 600, t.text, Align::Start, Align::Center);
+        y += 18.0f;
+        for (size_t i = 0; i < al.steps.size(); ++i) {
+            y += 8.0f;
+            float cy = y + 11.0f;
+            g.fill_ellipse(view.x + 10.0f, cy, 10.0f, 10.0f, t.accent.alpha(0.14f));
+            g.text(std::to_wstring(i + 1), RectF{view.x, cy - 10.0f, 20.0f, 20.0f}, 11.5f, 700, t.accent,
+                   Align::Center, Align::Center);
+            g.text(al.steps[i], RectF{view.x + step_indent, y + 1.0f, inner - step_indent, step_h[i] + 4.0f}, 13.0f,
+                   400, t.text2, Align::Start, Align::Start, true);
+            y += step_h[i];
+        }
+    }
+    if (!al.footer.empty()) {
+        y += 10.0f;
+        g.text(al.footer, RectF{view.x, y, inner, footer_h}, 11.5f, 400, t.text3, Align::Start, Align::Start, true);
+    }
+    g.pop_clip();
+    if (max_scroll > 0) {
+        // soft fades show there is more to scroll
+        if (alert_scroll_ > 1.0f)
+            g.fill_rrect_vgrad(RectF{view.x, view.y, view.w, 18.0f}, 0, t.glass_strong.alpha(0.9f),
+                               t.glass_strong.alpha(0.0f));
+        if (alert_scroll_ < max_scroll - 1.0f)
+            g.fill_rrect_vgrad(RectF{view.x, view.b() - 18.0f, view.w, 18.0f}, 0, t.glass_strong.alpha(0.0f),
+                               t.glass_strong.alpha(0.9f));
+        float th = std::max(24.0f, view.h * view.h / content_h);
+        float ty = view.y + (view.h - th) * (alert_scroll_ / max_scroll);
+        g.fill_rrect(RectF{r.r() - 10.0f, ty, 3.0f, th}, 1.5f, t.text3.alpha(0.5f));
+    }
     g.reset_transform();
 
     int n = static_cast<int>(al.buttons.size());
@@ -694,9 +796,12 @@ void Ui::draw_alert()
     if (alert_.open) {
         if (key == VK_RETURN) { chosen = al.def; key = 0; }
         else if (key == VK_ESCAPE) { chosen = al.cancel >= 0 ? al.cancel : al.def; key = 0; }
+        else if (key == VK_DOWN || key == VK_NEXT) { alert_scroll_ += key == VK_NEXT ? view_h : 40.0f; key = 0; }
+        else if (key == VK_UP || key == VK_PRIOR) { alert_scroll_ -= key == VK_PRIOR ? view_h : 40.0f; key = 0; }
         if (chosen >= 0) {
-            auto cb = alert_.on_close;
-            alert_.open = false;
+            auto cb = alert_.spec.on_click;
+            const auto& keep = alert_.spec.keep_open;
+            if (std::find(keep.begin(), keep.end(), chosen) == keep.end()) alert_.open = false;
             if (cb) defer([cb, chosen] { cb(chosen); });
         }
     }
@@ -724,10 +829,10 @@ void Ui::draw_tooltip()
 
 void Ui::end_frame()
 {
-    draw_toasts();
     draw_popover();
     draw_tooltip();
     draw_alert();
+    draw_toasts();   // on top, so feedback such as "Details copied" shows over an open alert
     if (released || !down) {
         if (released) active_.clear();
     }

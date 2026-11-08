@@ -10,12 +10,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <exception>
 #include <string>
 #include <vector>
 
 #ifndef LIDE50_VERSION
-#define LIDE50_VERSION "1.3.0"
+#define LIDE50_VERSION "1.4.0"
 #endif
 
 namespace {
@@ -25,6 +26,23 @@ std::wstring g_path;
 CRITICAL_SECTION g_lock;
 bool g_lock_ready = false;
 volatile LONG g_crashing = 0;
+wchar_t g_crash_marker[MAX_PATH * 2] = {};   // written when the app crashes, read at the next start
+
+// Records that the app crashed (no allocation beyond small buffers: this runs while crashing).
+void write_crash_marker(const char* what)
+{
+    if (!g_crash_marker[0]) return;
+    HANDLE h = CreateFileW(g_crash_marker, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    char buf[640];
+    int n = std::snprintf(buf, sizeof(buf), "%04u-%02u-%02u %02u:%02u\n%s\n", t.wYear, t.wMonth, t.wDay, t.wHour,
+                          t.wMinute, what ? what : "");
+    DWORD written = 0;
+    if (n > 0) WriteFile(h, buf, static_cast<DWORD>(std::min<size_t>(static_cast<size_t>(n), sizeof(buf) - 1)), &written, nullptr);
+    CloseHandle(h);
+}
 
 void raw_write(const char* data, size_t len)
 {
@@ -144,11 +162,16 @@ const char* exception_name(DWORD code)
 
 void show_crash_box(const std::string& what)
 {
-    std::wstring msg = L"LiDE50 Scan ran into a problem and has to close.\n\n" +
-                       std::wstring(what.begin(), what.end()) +
-                       L"\n\nThe details were written to:\n" + g_path +
-                       L"\n\nPlease send this log file so the problem can be fixed.";
-    MessageBoxW(nullptr, msg.c_str(), L"LiDE50 Scan - error", MB_OK | MB_ICONERROR | MB_TOPMOST | MB_TASKMODAL);
+    write_crash_marker(what.c_str());
+    std::wstring msg = L"LiDE50 Scan ran into a problem it couldn't recover from and has to close. Scans that "
+                       L"weren't saved are lost.\n\n"
+                       L"What to do:\n"
+                       L"1. Open LiDE50 Scan again. It will show what happened.\n"
+                       L"2. If this keeps happening, unplug the scanner, plug it back in and try a lower "
+                       L"resolution or a smaller area.\n"
+                       L"3. To report it, attach this log file (it has the details):\n   " + g_path +
+                       L"\n\nTechnical reason: " + std::wstring(what.begin(), what.end());
+    MessageBoxW(nullptr, msg.c_str(), L"LiDE50 Scan has to close", MB_OK | MB_ICONERROR | MB_TOPMOST | MB_TASKMODAL);
 }
 
 void log_exception_record(EXCEPTION_POINTERS* ep, const char* where)
@@ -201,6 +224,7 @@ LONG WINAPI vectored_handler(EXCEPTION_POINTERS* ep)
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW &&
         InterlockedExchange(&g_crashing, 1) == 0) {
         log_exception_record(ep, "Stack overflow");
+        write_crash_marker("Stack overflow (exception 0xC00000FD)");
         TerminateProcess(GetCurrentProcess(), 0xC00000FD);
     }
     return EXCEPTION_CONTINUE_SEARCH;
@@ -418,4 +442,53 @@ void log_system_info(const std::wstring& data_dir, const std::wstring& command_l
     logw("INFO", L"Settings/calibration folder: " + data_dir);
     logw("INFO", L"Log file: " + g_path);
     logf("INFO", "Running as administrator: %s", IsUserAnAdmin() ? "yes" : "no");
+}
+
+const char* app_version() { return LIDE50_VERSION; }
+
+void log_set_crash_marker(const std::wstring& path)
+{
+    wcsncpy(g_crash_marker, path.c_str(), MAX_PATH * 2 - 1);
+}
+
+std::string log_tail(size_t max_bytes)
+{
+    if (g_path.empty()) return {};
+    HANDLE h = CreateFileW(g_path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return {};
+    LARGE_INTEGER size{};
+    std::string out;
+    if (GetFileSizeEx(h, &size)) {
+        long long start = std::max<long long>(0, size.QuadPart - static_cast<long long>(max_bytes));
+        LARGE_INTEGER pos;
+        pos.QuadPart = start;
+        if (SetFilePointerEx(h, pos, nullptr, FILE_BEGIN)) {
+            out.resize(static_cast<size_t>(size.QuadPart - start));
+            DWORD got = 0;
+            if (!out.empty() && ReadFile(h, &out[0], static_cast<DWORD>(out.size()), &got, nullptr)) out.resize(got);
+            else out.clear();
+            // start at a whole line
+            if (start > 0) {
+                size_t nl = out.find('\n');
+                if (nl != std::string::npos) out.erase(0, nl + 1);
+            }
+        }
+    }
+    CloseHandle(h);
+    return out;
+}
+
+std::wstring windows_version_text()
+{
+    using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOEXW*);
+    OSVERSIONINFOEXW vi{};
+    vi.dwOSVersionInfoSize = sizeof(vi);
+    if (auto fn = reinterpret_cast<RtlGetVersionFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion")))
+        fn(&vi);
+    wchar_t buf[96];
+    swprintf(buf, 96, L"Windows %lu.%lu build %lu%ls", static_cast<unsigned long>(vi.dwMajorVersion),
+             static_cast<unsigned long>(vi.dwMinorVersion), static_cast<unsigned long>(vi.dwBuildNumber),
+             GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") ? L" (Wine)" : L"");
+    return buf;
 }

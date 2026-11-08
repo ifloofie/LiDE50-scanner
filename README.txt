@@ -1,4 +1,4 @@
-LiDE50 Scan 1.3 - portable scanning for the Canon CanoScan LiDE 50
+LiDE50 Scan 1.4 - portable scanning for the Canon CanoScan LiDE 50
 =====================================================================
 
 For 64-bit Windows 10 and 11. One file, no installer: LiDE50Scan.exe.
@@ -36,7 +36,7 @@ THE WINDOW
 - Top toolbar: Preview and Scan, which become a progress bar and a Cancel
   button while scanning. On the right are Show glass, Fit to window,
   light/dark mode and the More menu (save all, clear all, scanner access,
-  log files, background motion, About).
+  help topics, problem report, log files, background motion, About).
 - Middle: the scanner glass with your preview and the selected area, the
   scan as it comes in, or the selected finished scan.
 - Right panel: finished scans. Click one to view and adjust it.
@@ -117,19 +117,42 @@ log goes to %LOCALAPPDATA%\LiDE50Scan instead.
 
 TROUBLESHOOTING
 ---------------
-* "The scan head did not move or the sensor saw no light": turn the scanner
-  over. If there is a lock switch, slide it to UNLOCK. Then close the lid,
-  unplug the scanner, plug it back in and try again.
-* "Automatic setup did not succeed": use Scanner > Manual setup instructions.
-  In short: open Device Manager, right-click the CanoScan device, choose
-  Update driver > Browse my computer > Let me pick > Universal Serial Bus
-  devices > WinUsb Device.
+When something goes wrong, LiDE50 Scan says what happened in plain words and
+lists what to try, in order. Each message has a short code (for example
+CAL-NO-LIGHT) and a "Copy details" button that puts the message, the app and
+Windows versions and the recent log on the clipboard, ready to paste into a
+bug report. Where there is a direct fix, the message has a button for it
+(Try again, Enable scanner access, Open Device Manager, ...).
+
+The More menu (...) also has help topics: scanner not found, colours look
+wrong, noise or stretched scans, and the app closes.
+
+Common cases:
+* "The scanner couldn't see its light" (CAL-NO-LIGHT): close the lid, unplug
+  the scanner, plug it back in and click Try again. If there is a lock switch
+  underneath, slide it to unlocked. If the same colour fails every time, that
+  LED in the scan head may have failed; Grayscale may still work.
+* "Colours may be off in this scan" (CAL-COLOUR) or "Too much light reached
+  the sensor" (CAL-STRAY-LIGHT): close the lid (cover a thick book with a
+  dark cloth), keep the scanner out of direct sunlight, clean the glass and
+  the white strip inside the lid, and scan again. Calibration starts fresh
+  for every scan; a calibration that didn't settle is never reused.
+* "Another driver is using the scanner" (USB-OTHER-DRIVER): for example
+  Canon's own driver. "Switch to LiDE50 Scan" assigns Windows' WinUSB driver.
+  "Remove scanner access" in the More menu undoes this.
+* "Automatic setup didn't work": use More > Manual setup steps. In short:
+  open Device Manager, right-click the CanoScan device, choose Update driver
+  > Browse my computer > Let me pick > Universal Serial Bus devices > WinUsb
+  Device.
 * USB errors: plug the scanner straight into the PC rather than through a
-  hub, then unplug and replug it.
-* Streaky or dark scans: make sure the scan head is unlocked, close the lid,
-  and delete LiDE50Scan-data\.sane\canon-lide-50.cal to force a new calibration.
-* To undo the setup, use Scanner > Remove scanner access.
-* Any problem: send LiDE50Scan.log (Help > Show the log file in its folder).
+  hub, then unplug and replug it. The app reconnects by itself.
+* "Windows didn't allow saving there" (SAVE-DENIED): Windows Security's
+  ransomware protection blocks unknown apps from Documents, Pictures and the
+  Desktop. Save to another folder or allow LiDE50Scan.exe there.
+* A grinding noise or stretched scans at 75-200 dpi: the motor runs fastest
+  there. Try 300 dpi or higher, on a firm, flat surface.
+* If the app closes unexpectedly, open it again: it shows what happened, and
+  Copy details includes the crash report.
 * Demo without a scanner: run "LiDE50Scan.exe --simulate".
 
 
