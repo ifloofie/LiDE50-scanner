@@ -1,4 +1,6 @@
 // LiDE50 Scan - every problem the app can run into, in plain language.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 the LiDE50 Scan contributors
 #include "problems.h"
 
 #include "../core/include/lide50_diag.h"

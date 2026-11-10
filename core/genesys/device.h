@@ -2,6 +2,10 @@
 
    Copyright (C) 2019 Povilas Kanapickas <povilas@radix.lt>
 
+   Modified for LiDE50 Scan (https://github.com/ifloofie/LiDE50-scanner):
+   2026-11-08  Added Genesys_Device::lide50_default_exposure.
+   2026-11-10  Added Genesys_Device::lide50_led_unsettled.
+
    This file is part of the SANE package.
 
    This program is free software; you can redistribute it and/or
@@ -294,6 +298,9 @@ struct Genesys_Device
     // LiDE50 Scan: the sensor table's LED exposure when the scanner was opened. Used to
     // reset a calibrated exposure that is out of the safe range.
     SensorExposure lide50_default_exposure{0x400, 0x400, 0x400};
+    // LiDE50 Scan: the last LED calibration did not settle. Its exposure was used for that
+    // scan only; the next LED calibration starts from the default again.
+    bool lide50_led_unsettled = false;
 
     // for sheetfed scanner's, is TRUE when there is a document in the scanner
     bool document = false;

@@ -1,7 +1,10 @@
 // LiDE50 Scan - Direct2D / DirectWrite drawing layer.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 the LiDE50 Scan contributors
 #include "gfx.h"
 
 #include "../image.h"
+#include "../sysdll.h"
 
 #include <algorithm>
 #include <cmath>
@@ -40,11 +43,11 @@ bool Gfx::init(HWND hwnd)
     hwnd_ = hwnd;
     wine_ = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
     D2D1_FACTORY_OPTIONS opts{};
-    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory), &opts,
-                                 reinterpret_cast<void**>(&factory_))))
+    if (FAILED(sys_D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory), &opts,
+                                     reinterpret_cast<void**>(&factory_))))
         return false;
-    if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
-                                   reinterpret_cast<IUnknown**>(&dwrite_))))
+    if (FAILED(sys_DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                                       reinterpret_cast<IUnknown**>(&dwrite_))))
         return false;
     // Windows 11 ships "Segoe UI Variable"; Windows 10 has Segoe UI.
     IDWriteFontCollection* fonts = nullptr;

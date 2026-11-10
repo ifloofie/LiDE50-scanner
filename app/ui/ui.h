@@ -3,6 +3,8 @@
 // Each frame the application lays out and draws its widgets; widgets read the
 // current pointer state, keep small animation states keyed by id, and report
 // clicks. Overlays (popovers, tooltips, toasts, alerts) are drawn last.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 the LiDE50 Scan contributors
 #pragma once
 
 #include "gfx.h"
@@ -72,6 +74,8 @@ public:
     void set_anim(const std::string& key, float v);
     void set_spring(const std::string& key, float v);
     bool has_spring(const std::string& key) const { return springs_.count(key) != 0; }
+    // drops the animation state of a widget that no longer exists (ids starting with `prefix` + ".")
+    void forget(const std::string& prefix);
 
     // ---- hit testing ----
     bool hover(const std::string& id, const RectF& r);

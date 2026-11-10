@@ -1,4 +1,6 @@
 /* LiDE50 Scan - diagnostics passed from the built-in driver to the app.
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ * Copyright (C) 2026 the LiDE50 Scan contributors
  *
  * The SANE interface only returns a status code. These functions keep the
  * driver's own error text and the results of the last calibration, so the app
@@ -29,7 +31,7 @@ struct Lide50CalibReport {
     int led_dim_channel;         /* -1, or the colour (0 R, 1 G, 2 B) that stayed too dark */
     int led_bright_channel;      /* -1, or the colour that stayed too bright */
     unsigned white_level[3];     /* coarse gain: 95th percentile of the white strip, R G B (16 bit) */
-    int low_light_channel;       /* -1, or the colour that saw almost no light (the "locked" check) */
+    int low_light_channel;       /* -1, the colour that saw almost no light (the "locked" check), or 3 = gray (all LEDs) */
     int reset_bad_exposure;      /* an out-of-range exposure was found and reset to the default */
     int cache_rejected;          /* a cached calibration was ignored because its values were invalid */
 };

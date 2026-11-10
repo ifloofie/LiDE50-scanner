@@ -15,6 +15,15 @@
    Software processing for deskew, crop and dspeckle are inspired by allan's
    noah work in the fujitsu backend
 
+   Modified for LiDE50 Scan (https://github.com/ifloofie/LiDE50-scanner):
+   2026-10-12  Built for Windows as part of LiDE50 Scan; only the GL841 command set is used.
+   2026-11-08  LED calibration: exposure kept in a safe range, unsettled results detected and
+               not stored or cached; invalid cached calibrations ignored; the low-light check
+               names the colour and parks the head; calibration results reported through
+               lide50_diag.h.
+   2026-11-10  An unsettled LED exposure is no longer the starting point of the next
+               calibration; gray mode reports low light as "all colours".
+
    This file is part of the SANE package.
 
    This program is free software; you can redistribute it and/or
@@ -1919,7 +1928,8 @@ void scanner_coarse_gain_calibration(Genesys_Device& dev, const Genesys_Sensor& 
             DBG(DBG_error0, "%s: the %s light measured %.0f of %.0f expected (exposure %d, %d, %d)\n",
                 __func__, colour, curr_output, target_value, calib_sensor->exposure.red,
                 calib_sensor->exposure.green, calib_sensor->exposure.blue);
-            lide50_diag_calib()->low_light_channel = channels == 1 ? 1 : static_cast<int>(ch);
+            // 3 = all colours together (gray mode: the three LEDs are lit at once)
+            lide50_diag_calib()->low_light_channel = channels == 1 ? 3 : static_cast<int>(ch);
             // LiDE50 Scan: return the head home before failing, so the next try starts cleanly
             catch_all_exceptions(__func__, [&]() { scanner_stop_action(dev); });
             catch_all_exceptions(__func__, [&]() { dev.cmd_set->move_back_home(&dev, true); });
@@ -2044,6 +2054,15 @@ SensorExposure scanner_led_calibration(Genesys_Device& dev, const Genesys_Sensor
     unsigned stuck[3] = {0, 0, 0};
     unsigned tries = 0;
     if (dev.model->asic_type == AsicType::GL841) {
+        // an unsettled result from the previous scan is not a starting point
+        if (dev.lide50_led_unsettled) {
+            dbg.vlog(DBG_info, "the previous LED calibration did not settle; starting from %d, %d, %d",
+                     default_exp[0], default_exp[1], default_exp[2]);
+            for (unsigned i = 0; i < 3; i++) {
+                exp[i] = static_cast<std::uint16_t>(default_exp[i]);
+            }
+            dev.lide50_led_unsettled = false;
+        }
         for (unsigned i = 0; i < 3; i++) {
             if (exp[i] < LIDE50_LED_EXPOSURE_MIN || exp[i] > LIDE50_LED_EXPOSURE_MAX) {
                 dbg.vlog(DBG_warn, "LED exposure %d of colour %d is out of range; starting from %d",
@@ -3740,6 +3759,11 @@ static void genesys_flatbed_calibration(Genesys_Device* dev, Genesys_Sensor& sen
                             sanei_genesys_find_sensors_all_for_write(dev, sensor.method)) {
                         sensor_update.get().exposure = calib_exposure;
                     }
+                    dev->lide50_led_unsettled = false;
+                } else {
+                    // `sensor` below is this resolution's table entry, so it keeps the unsettled
+                    // value until the next LED calibration, which then restarts from the default
+                    dev->lide50_led_unsettled = true;
                 }
                 sensor.exposure = calib_exposure;
                 break;

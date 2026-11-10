@@ -13,6 +13,10 @@
                  for Plustek Opticbook 3600 support
    Copyright (C) 2019 Povilas Kanapickas <povilas@radix.lt>
 
+   Modified for LiDE50 Scan (https://github.com/ifloofie/LiDE50-scanner):
+   2026-10-12  Only the Canon LiDE 50 (USB 04A9:2213) is registered; the other models'
+               definitions are kept but not added to the device list.
+
    This file is part of the SANE package.
 
    This program is free software; you can redistribute it and/or

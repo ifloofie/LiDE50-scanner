@@ -1,4 +1,6 @@
 // LiDE50 Scan - diagnostics passed from the built-in driver to the app.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 the LiDE50 Scan contributors
 #include "lide50_diag.h"
 
 #include <cstdio>

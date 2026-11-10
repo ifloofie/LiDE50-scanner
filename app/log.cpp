@@ -1,4 +1,6 @@
 // LiDE50 Scan - activity log and crash reporting.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 the LiDE50 Scan contributors
 #include "log.h"
 
 #include <windows.h>
@@ -16,7 +18,7 @@
 #include <vector>
 
 #ifndef LIDE50_VERSION
-#define LIDE50_VERSION "1.4.0"
+#define LIDE50_VERSION "1.45.0"
 #endif
 
 namespace {

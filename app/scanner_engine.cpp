@@ -1,4 +1,6 @@
 // LiDE50 Scan - scanner engine implementation.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 the LiDE50 Scan contributors
 #include "scanner_engine.h"
 
 #include <windows.h>
@@ -114,14 +116,50 @@ void ScannerEngine::start(const std::wstring& data_dir, bool simulate, bool fake
     std::wstring sane_dir = data_dir + L"\\.sane";
     CreateDirectoryW(data_dir.c_str(), nullptr);
     CreateDirectoryW(sane_dir.c_str(), nullptr);
-    wchar_t shortp[MAX_PATH] = {};
-    std::wstring use = data_dir;
-    if (GetShortPathNameW(data_dir.c_str(), shortp, MAX_PATH) > 0) use = shortp;
-    char narrow[MAX_PATH * 2] = {};
-    WideCharToMultiByte(CP_ACP, 0, use.c_str(), -1, narrow, sizeof(narrow), nullptr, nullptr);
-    std::string env = std::string("HOME=") + narrow;
-    _putenv(env.c_str());
-    LOG_INFO("engine: calibration cache folder %s\\.sane", narrow);
+    // The driver opens it with narrow-character file functions, so the path must survive the
+    // conversion to the system code page. If the app's folder has characters outside it (and
+    // no short 8.3 name), use the per-user data folder, then the temporary folder.
+    auto narrow_path = [](const std::wstring& dir, std::string& out) {
+        wchar_t shortp[MAX_PATH] = {};
+        std::wstring use = dir;
+        DWORD sn = GetShortPathNameW(dir.c_str(), shortp, MAX_PATH);
+        if (sn > 0 && sn < MAX_PATH) use = shortp;
+        char narrow[MAX_PATH * 2] = {};
+        BOOL lossy = FALSE;
+        int n = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, use.c_str(), -1, narrow, sizeof(narrow), nullptr,
+                                    &lossy);
+        if (n <= 0 || lossy) return false;
+        out = narrow;
+        return true;
+    };
+    std::string home;
+    bool home_ok = narrow_path(data_dir, home);
+    if (!home_ok) {
+        std::vector<std::wstring> fallbacks;
+        wchar_t buf[MAX_PATH] = {};
+        DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) fallbacks.push_back(std::wstring(buf) + L"\\LiDE50Scan");
+        n = GetTempPathW(MAX_PATH, buf);
+        if (n > 0 && n < MAX_PATH) fallbacks.push_back(std::wstring(buf) + L"LiDE50Scan");
+        for (const auto& dir : fallbacks) {
+            CreateDirectoryW(dir.c_str(), nullptr);
+            CreateDirectoryW((dir + L"\\.sane").c_str(), nullptr);
+            if (narrow_path(dir, home)) {
+                home_ok = true;
+                logw("WARN", L"engine: the settings folder's name can't be used by the driver; the calibration "
+                             L"cache is kept in " + dir);
+                break;
+            }
+        }
+    }
+    if (home_ok) {
+        std::string env = std::string("HOME=") + home;
+        _putenv(env.c_str());
+        LOG_INFO("engine: calibration cache folder %s\\.sane", home.c_str());
+    } else {
+        _putenv("HOME=");
+        LOG_WARN("engine: no usable folder for the calibration cache; the scanner calibrates before every scan");
+    }
 
     // driver trace level: 4 = info, 5 = every driver function, 6 = every register access,
     // 7 = every data block
@@ -205,8 +243,17 @@ void ScannerEngine::stop()
         queue_.push_back({Cmd::Quit, {}});
     }
     queue_cv_.notify_all();
-    if (WaitForSingleObject(thread_, 15000) == WAIT_TIMEOUT)
-        LOG_WARN("engine: scanner thread did not stop within 15 s");
+    // Calibration can't be interrupted and the scan head has to travel home, so this can
+    // take a while after a long scan. The thread uses this object: never tear it down while
+    // the thread is still running.
+    if (WaitForSingleObject(thread_, 15000) == WAIT_TIMEOUT) {
+        LOG_WARN("engine: the scanner is still finishing (returning the scan head); waiting up to 75 s more");
+        if (WaitForSingleObject(thread_, 75000) == WAIT_TIMEOUT) {
+            LOG_ERROR("engine: scanner thread did not stop within 90 s; ending the program now");
+            LOG_INFO("LiDE50 Scan exited (scanner thread stopped by force)");
+            TerminateProcess(GetCurrentProcess(), 0);
+        }
+    }
     CloseHandle(thread_);
     thread_ = nullptr;
 }
@@ -303,6 +350,9 @@ void ScannerEngine::thread_main()
             }
             parking_ = false;
             busy_ = false;
+            // some results are reported before the busy flag clears: make the window draw
+            // once more now that the scanner is free
+            cb_(EngineEvent::Status, "");
         }
     }
     LOG_INFO("engine: shutting down driver");
@@ -398,14 +448,14 @@ void ScannerEngine::do_connect()
         auto* d = sane_genesys_get_option_descriptor(h, bry);
         if (d && d->constraint_type == SANE_CONSTRAINT_RANGE) bed_h_ = to_mm(d->constraint.range->max);
     }
-    if (!(bed_w_ > 50 && bed_w_ < 400)) bed_w_ = 216.0;
-    if (!(bed_h_ > 50 && bed_h_ < 500)) bed_h_ = 297.0;
+    if (!(bed_w_.load() > 50 && bed_w_.load() < 400)) bed_w_ = 216.0;
+    if (!(bed_h_.load() > 50 && bed_h_.load() < 500)) bed_h_ = 297.0;
     std::string label = std::string(list[0]->vendor ? list[0]->vendor : "Canon") + " " +
                         (list[0]->model ? list[0]->model : "LiDE 50");
     if (label.find("LiDE") != std::string::npos) label = "Canon CanoScan LiDE 50";
     if (simulate_) label += " (simulated)";
     if (fake_usb_) label += " (fake USB test device)";
-    LOG_INFO("engine: connected to %s, glass %.1f x %.1f mm", label.c_str(), bed_w_, bed_h_);
+    LOG_INFO("engine: connected to %s, glass %.1f x %.1f mm", label.c_str(), bed_w_.load(), bed_h_.load());
     log_options();
     cb_(EngineEvent::Connected, label);
 }
@@ -594,8 +644,8 @@ void ScannerEngine::do_scan(const ScanRequest& req)
     auto h = static_cast<SANE_Handle>(handle_);
     lide50_diag_reset_scan();
 
-    // test hook for the crash reporter: LIDE50_CRASH_TEST=1
-    if (const char* ct = std::getenv("LIDE50_CRASH_TEST")) {
+    // test hook for the crash reporter: LIDE50_CRASH_TEST=1 (only with --simulate or --fake-usb)
+    if (const char* ct = (simulate_ || fake_usb_) ? std::getenv("LIDE50_CRASH_TEST") : nullptr) {
         if (*ct == '1') {
             LOG_WARN("engine: LIDE50_CRASH_TEST set - crashing on purpose");
             *static_cast<volatile int*>(nullptr) = 1;
@@ -608,8 +658,9 @@ void ScannerEngine::do_scan(const ScanRequest& req)
                                                     : SANE_VALUE_SCAN_MODE_GRAY;
     SANE_Word depth = 8;
     SANE_Word dpi = req.dpi;
-    double tl_x = std::clamp(req.tl_x, 0.0, bed_w_ - 1.0), tl_y = std::clamp(req.tl_y, 0.0, bed_h_ - 1.0);
-    double br_x = std::clamp(req.br_x, tl_x + 1.0, bed_w_), br_y = std::clamp(req.br_y, tl_y + 1.0, bed_h_);
+    const double bed_w = bed_w_.load(), bed_h = bed_h_.load();
+    double tl_x = std::clamp(req.tl_x, 0.0, bed_w - 1.0), tl_y = std::clamp(req.tl_y, 0.0, bed_h - 1.0);
+    double br_x = std::clamp(req.br_x, tl_x + 1.0, bed_w), br_y = std::clamp(req.br_y, tl_y + 1.0, bed_h);
     SANE_Word tlx = SANE_FIX(tl_x), tly = SANE_FIX(tl_y), brx = SANE_FIX(br_x), bry = SANE_FIX(br_y);
     SANE_Bool preview = SANE_FALSE; // full-quality preview; resolution is already low
 

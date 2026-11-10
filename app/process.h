@@ -1,4 +1,6 @@
 // LiDE50 Scan - non-destructive image adjustments.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 the LiDE50 Scan contributors
 #pragma once
 #include "image.h"
 
@@ -23,9 +25,6 @@ struct Adjustments {
 
 // Downscale so that neither side exceeds max_side (box filter). Returns src copy if smaller.
 Image downscale(const Image& src, int max_side);
-
-// Crop a rectangle in pixel units (clamped).
-Image crop(const Image& src, int x, int y, int w, int h);
 
 // Apply all adjustments. `scale_hint` is the ratio of this image's resolution
 // to the full-resolution scan, so sharpening/denoise radii look the same on

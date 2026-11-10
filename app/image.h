@@ -1,4 +1,6 @@
 // LiDE50 Scan - simple 8-bit image container.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 the LiDE50 Scan contributors
 #pragma once
 #include <cstdint>
 #include <vector>

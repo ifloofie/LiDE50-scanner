@@ -7,6 +7,8 @@
 // the real-hardware code paths of the driver be exercised without a scanner.
 //
 // Part of LiDE50 Scan. Licensed GPL-2.0-or-later (same as SANE backends).
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 the LiDE50 Scan contributors
 
 #include "../include/sane/config.h"
 #include "../include/sane/sane.h"

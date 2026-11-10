@@ -88,9 +88,10 @@ build, use `git clone --recursive`, or use the complete source archive
 |---|---|
 | `app/` | Windows app: user interface (Direct2D), scanner engine, image adjustments, file writers, WinUSB setup, logging |
 | `app/ui/` | Drawing layer and glass widget toolkit |
-| `core/genesys/` | SANE 1.2.1 genesys backend, reduced to the GL841 / Canon LiDE 50 |
+| `core/genesys/` | SANE 1.2.1 genesys backend, reduced to the GL841 / Canon LiDE 50. Five files differ from SANE 1.2.1 (`genesys.cpp`, `low.cpp`, `tables_model.cpp`, `device.h`, `error.h`); each lists its changes with dates in its header. The other chips' `.cpp` files are left out. |
 | `core/shim/` | Windows replacements for SANE's USB, configuration and debug helpers (libusb/WinUSB) |
-| `third_party/libusb/` | libusb 1.0.27 (submodule linked to the official repository) |
+| `third_party/libusb/` | libusb 1.0.30 (submodule linked to the official repository) |
+| `tests/` | Tests for the file writers and image adjustments (`make test`, runs on the build machine) |
 | `third_party/` | miniz and stb_image_write |
 
 ## Credits
@@ -99,8 +100,8 @@ LiDE50 Scan is built on these open-source projects:
 
 | Project | Version | Used for | License |
 |---|---|---|---|
-| [SANE backends](https://gitlab.com/sane-project/backends) ([sane-project.org](http://www.sane-project.org/)) | [1.2.1](https://gitlab.com/sane-project/backends/-/tree/1.2.1/backend/genesys) | The scanner driver: the `genesys` backend's GL841 / Canon LiDE 50 support. **Modified:** reduced to this one scanner and adapted to Windows (see `core/`). | GPL-2.0-or-later |
-| [libusb](https://github.com/libusb/libusb) | [v1.0.27](https://github.com/libusb/libusb/releases/tag/v1.0.27) | USB communication with the scanner through Windows' WinUSB driver. Included unmodified as a submodule. | LGPL-2.1-or-later |
+| [SANE backends](https://gitlab.com/sane-project/backends) ([sane-project.org](http://www.sane-project.org/)) | [1.2.1](https://gitlab.com/sane-project/backends/-/tree/1.2.1/backend/genesys) | The scanner driver: the `genesys` backend's GL841 / Canon LiDE 50 support. **Modified:** reduced to this one scanner, adapted to Windows, and the LED calibration made safe (the changed files carry dated notices; see `core/`). | GPL-2.0-or-later |
+| [libusb](https://github.com/libusb/libusb) | [v1.0.30](https://github.com/libusb/libusb/releases/tag/v1.0.30) | USB communication with the scanner through Windows' WinUSB driver. Included unmodified as a submodule. | LGPL-2.1-or-later |
 | [miniz](https://github.com/richgel999/miniz) | [3.0.2](https://github.com/richgel999/miniz/releases/tag/3.0.2) | Compression for PNG, PDF and Word (.docx) files. Single-file amalgamated build, unmodified. | MIT |
 | [stb](https://github.com/nothings/stb) | [stb_image_write v1.16](https://github.com/nothings/stb/blob/master/stb_image_write.h) | JPEG and BMP encoding. Unmodified. | Public domain / MIT |
 

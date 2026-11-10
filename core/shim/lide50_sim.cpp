@@ -1,6 +1,8 @@
 #define DEBUG_DECLARE_ONLY
 // Enables the genesys backend's built-in virtual device mode for a LiDE 50.
 // Used only by LiDE50 Scan's --simulate switch (testing without hardware).
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 the LiDE50 Scan contributors
 #include "../genesys/test_settings.h"
 #include "../genesys/test_scanner_interface.h"
 
