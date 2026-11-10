@@ -2,6 +2,9 @@
 
    Copyright (C) 2019 Povilas Kanapickas <povilas@radix.lt>
 
+   Modified for LiDE50 Scan (https://github.com/ifloofie/LiDE50-scanner):
+   2026-11-08  The exception wrappers also pass the error text to lide50_diag.h.
+
    This file is part of the SANE package.
 
    This program is free software; you can redistribute it and/or

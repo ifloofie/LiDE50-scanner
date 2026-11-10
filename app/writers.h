@@ -1,5 +1,8 @@
 // LiDE50 Scan - output file writers.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 the LiDE50 Scan contributors
 #pragma once
+#include "encoders.h"
 #include "image.h"
 
 #include <string>
@@ -7,10 +10,6 @@
 
 enum class OutFormat { PDF, DOCX, PNG, JPEG, TIFF, BMP };
 
-struct SaveOptions {
-    int jpeg_quality = 90;      // JPEG and PDF/DOCX color pages
-    bool pdf_lossless = false;  // PDF: Flate instead of JPEG for color/gray
-};
 
 const wchar_t* format_extension(OutFormat f);          // e.g. L"pdf"
 const wchar_t* format_filter(OutFormat f);             // file dialog filter (double-NUL terminated)
@@ -24,7 +23,3 @@ bool format_multipage(OutFormat f);                    // PDF, DOCX, TIFF hold s
 bool write_document(const std::wstring& path, OutFormat f, const std::vector<const Image*>& pages,
                     const SaveOptions& opt, std::wstring& error, unsigned long* win32_error = nullptr,
                     double* needed_mb = nullptr, double* free_mb = nullptr);
-
-// Encoders exposed for tests.
-std::vector<unsigned char> encode_png(const Image& img);
-std::vector<unsigned char> encode_jpeg(const Image& img, int quality);

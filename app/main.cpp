@@ -4,6 +4,8 @@
 // and dark themes.
 //
 // Licensed GPL-2.0-or-later (it contains code from SANE's genesys backend).
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 the LiDE50 Scan contributors
 
 #ifndef UNICODE
 #define UNICODE
@@ -16,7 +18,6 @@
 #include <windowsx.h>
 #include <commdlg.h>
 #include <dbt.h>
-#include <dwmapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <initguid.h>
@@ -38,6 +39,7 @@
 #include "problems.h"
 #include "process.h"
 #include "scanner_engine.h"
+#include "sysdll.h"
 #include "ui/gfx.h"
 #include "ui/ui.h"
 #include "winusb_setup.h"
@@ -145,7 +147,7 @@ int g_format_idx = 0;
 int g_quality = 90;
 bool g_lossless = false;
 
-std::vector<std::unique_ptr<Page>> g_pages;
+std::vector<std::shared_ptr<Page>> g_pages;
 int g_selected = -1;
 int g_page_counter = 0;
 
@@ -261,6 +263,23 @@ void run_access_setup(bool remove);
 void begin_scan(const ScanRequest& r);
 void check_scanner();
 
+// Full paths for the Windows programs the app starts, so a file with the same name in the
+// current folder can never be started instead.
+std::wstring system_file(const wchar_t* name)
+{
+    wchar_t dir[MAX_PATH] = {};
+    UINT n = GetSystemDirectoryW(dir, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return name;
+    return std::wstring(dir) + L"\\" + name;
+}
+std::wstring windows_file(const wchar_t* name)
+{
+    wchar_t dir[MAX_PATH] = {};
+    UINT n = GetWindowsDirectoryW(dir, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return name;
+    return std::wstring(dir) + L"\\" + name;
+}
+
 bool copy_to_clipboard(const std::wstring& text)
 {
     if (!OpenClipboard(g_main)) return false;
@@ -277,6 +296,29 @@ bool copy_to_clipboard(const std::wstring& text)
     }
     CloseClipboard();
     return ok;
+}
+
+// Replaces the user's profile folder (which contains the Windows user name) with
+// %USERPROFILE%, so a pasted report doesn't give the name away.
+std::wstring hide_user_folder(std::wstring t)
+{
+    PWSTR p = nullptr;
+    std::wstring profile;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Profile, 0, nullptr, &p)) && p) profile = p;
+    CoTaskMemFree(p);
+    if (profile.size() < 4) return t;
+    auto lower = [](std::wstring v) {
+        if (!v.empty()) CharLowerBuffW(&v[0], static_cast<DWORD>(v.size()));
+        return v;
+    };
+    const std::wstring needle = lower(profile);
+    std::wstring hay = lower(t);
+    const std::wstring with = L"%USERPROFILE%";
+    for (size_t at = hay.find(needle); at != std::wstring::npos; at = hay.find(needle, at + with.size())) {
+        t.replace(at, needle.size(), with);
+        hay.replace(at, needle.size(), with);
+    }
+    return t;
 }
 
 // A report the user can paste into a bug report: the problem, the app and Windows
@@ -300,6 +342,7 @@ void copy_problem_report(const Problem* p)
     }
     if (cut > 0) tail.erase(0, cut + 1);
     t += widen(tail);
+    t = hide_user_folder(t);
     if (copy_to_clipboard(t)) {
         LOG_UI("copied a problem report (%s) to the clipboard", p ? p->code.c_str() : "general");
         g_ui.toast(L"Details copied. Paste them into your report or message.", 1);
@@ -316,7 +359,7 @@ void run_fix(FixAction fix, const std::function<void()>& retry)
             g_ui.alert(L"Manual setup", usb_manual_setup_instructions(), {L"OK"}, nullptr);
             break;
         case FixAction::OpenDeviceManager:
-            ShellExecuteW(g_main, L"open", L"devmgmt.msc", nullptr, nullptr, SW_SHOWNORMAL);
+            ShellExecuteW(g_main, L"open", system_file(L"devmgmt.msc").c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             break;
         case FixAction::OpenRansomwareSettings:
             if (reinterpret_cast<INT_PTR>(ShellExecuteW(g_main, L"open", L"windowsdefender://ransomwareprotection",
@@ -373,13 +416,13 @@ bool system_prefers_dark()
 void apply_title_bar_theme()
 {
     BOOL dark = g_dark ? TRUE : FALSE;
-    DwmSetWindowAttribute(g_main, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof(dark));
+    sys_DwmSetWindowAttribute(g_main, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof(dark));
     Theme t = g_dark ? theme_dark() : theme_light();
     COLORREF cap = RGB(static_cast<int>(t.base2.r * 255), static_cast<int>(t.base2.g * 255),
                        static_cast<int>(t.base2.b * 255));
-    DwmSetWindowAttribute(g_main, 35 /*DWMWA_CAPTION_COLOR*/, &cap, sizeof(cap));
+    sys_DwmSetWindowAttribute(g_main, 35 /*DWMWA_CAPTION_COLOR*/, &cap, sizeof(cap));
     COLORREF txt = g_dark ? RGB(245, 245, 247) : RGB(28, 28, 30);
-    DwmSetWindowAttribute(g_main, 36 /*DWMWA_TEXT_COLOR*/, &txt, sizeof(txt));
+    sys_DwmSetWindowAttribute(g_main, 36 /*DWMWA_TEXT_COLOR*/, &txt, sizeof(txt));
 }
 
 // ------------------------------------------------------- page/adj helpers
@@ -673,7 +716,9 @@ std::wstring documents_dir()
     return out;
 }
 
-bool ask_save_path(OutFormat f, const std::wstring& suggested, std::wstring& path)
+// `numbered`: the name is only the base for name_001, name_002..., so the dialog's own
+// "replace this file?" question would be about a file that is never written.
+bool ask_save_path(OutFormat f, const std::wstring& suggested, std::wstring& path, bool numbered = false)
 {
     wchar_t file[MAX_PATH * 4] = {};
     std::wstring name = suggested + L"." + format_extension(f);
@@ -690,7 +735,7 @@ bool ask_save_path(OutFormat f, const std::wstring& suggested, std::wstring& pat
     ofn.nMaxFile = MAX_PATH * 4;
     ofn.lpstrInitialDir = dir.empty() ? nullptr : dir.c_str();
     ofn.lpstrDefExt = format_extension(f);
-    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    ofn.Flags = (numbered ? 0 : OFN_OVERWRITEPROMPT) | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (!GetSaveFileNameW(&ofn)) {
         DWORD e = CommDlgExtendedError();
         if (e == 0) return false;  // the user cancelled
@@ -709,38 +754,66 @@ bool ask_save_path(OutFormat f, const std::wstring& suggested, std::wstring& pat
     return true;
 }
 
-void save_pages(bool all)
-{
-    if (g_pages.empty() || g_saving) return;
-    LOG_UI("clicked '%s'", all ? "Save all" : "Save scan");
-    std::vector<int> idx;
-    if (all) {
-        for (size_t i = 0; i < g_pages.size(); ++i) idx.push_back(static_cast<int>(i));
-    } else {
-        int i = g_selected >= 0 && g_selected < static_cast<int>(g_pages.size()) ? g_selected
-                                                                                   : static_cast<int>(g_pages.size()) - 1;
-        idx.push_back(i);
-    }
-    OutFormat f = ui_format();
-    std::wstring path;
-    if (!ask_save_path(f, timestamp_name(), path)) return;
+bool g_last_save_all = false;   // what "Try again" after a failed save repeats
 
+// The files a save writes: one file, or name_001.ext, name_002.ext... when the format
+// holds one scan per file.
+std::vector<std::wstring> save_targets(const std::wstring& path, OutFormat f, size_t count)
+{
+    if (format_multipage(f) || count == 1) return {path};
+    std::wstring base = path, ext;
+    size_t dot = path.find_last_of(L'.');
+    size_t slash = path.find_last_of(L"\\/");
+    if (dot != std::wstring::npos && (slash == std::wstring::npos || dot > slash)) {
+        base = path.substr(0, dot);
+        ext = path.substr(dot);
+    }
+    std::vector<std::wstring> out;
+    for (size_t i = 0; i < count; ++i) {
+        wchar_t num[16];
+        swprintf(num, 16, L"_%03zu", i + 1);
+        out.push_back(base + num + ext);
+    }
+    return out;
+}
+
+std::wstring file_name_of(const std::wstring& path) { return path.substr(path.find_last_of(L"\\/") + 1); }
+
+// Starts the save thread. The thread shares ownership of the scans, so deleting or
+// clearing scans while it runs can never pull the images out from under it.
+void launch_save(std::vector<std::shared_ptr<Page>> pages, OutFormat f, const std::wstring& path)
+{
+    if (pages.empty() || g_saving) return;
     SaveOptions opt;
     opt.jpeg_quality = g_quality;
     opt.pdf_lossless = g_lossless;
 
-    std::vector<std::pair<const Image*, Adjustments>> jobs;
-    for (int i : idx) jobs.emplace_back(&g_pages[static_cast<size_t>(i)]->raw, g_pages[static_cast<size_t>(i)]->adj);
+    struct Job { std::shared_ptr<Page> page; Adjustments adj; };
+    std::vector<Job> jobs;
+    for (auto& p : pages) jobs.push_back({p, p->adj});
+    const std::vector<std::wstring> targets = save_targets(path, f, jobs.size());
 
-    // rough memory check: the adjusted copy of each scan is made while saving
+    // Rough memory check. While saving there is the adjusted copy of each scan, up to two
+    // more copies while noise reduction or sharpening runs, and the encoded file.
+    auto job_mb = [f](const Job& j) {
+        double mb = static_cast<double>(j.page->raw.data.size()) / 1048576.0;
+        double copies = (j.adj.denoise > 0 || j.adj.sharpness > 0) ? 3.2 : 1.2;   // while adjusting
+        double encode = (f == OutFormat::PNG || f == OutFormat::TIFF || f == OutFormat::BMP) ? 2.2 : 1.0;
+        return mb * (copies > 1.0 + encode ? copies : 1.0 + encode);
+    };
     double need_mb = 0;
-    for (auto& j : jobs) need_mb += static_cast<double>(j.first->data.size()) / 1048576.0;
-    if (!format_multipage(f) || jobs.size() == 1) {
-        double biggest = 0;
-        for (auto& j : jobs) biggest = std::max(biggest, static_cast<double>(j.first->data.size()) / 1048576.0);
-        need_mb = biggest;  // separate files are processed one at a time
+    if (targets.size() == 1 && jobs.size() > 1) {
+        // one file holding every scan: all adjusted copies exist at the same time
+        double adjusted = 0, peak = 0;
+        for (auto& j : jobs) {
+            adjusted += static_cast<double>(j.page->raw.data.size()) / 1048576.0;
+            peak = std::max(peak, job_mb(j));
+        }
+        need_mb = adjusted * 2.0 + peak;
+    } else {
+        for (auto& j : jobs) need_mb = std::max(need_mb, job_mb(j));   // one scan at a time
     }
-    need_mb = need_mb * 2.2 + 32;  // adjusted copy plus encoded file
+    need_mb += 32;
     {
         MEMORYSTATUSEX ms{};
         ms.dwLength = sizeof(ms);
@@ -751,9 +824,10 @@ void save_pages(bool all)
     }
 
     g_saving = true;
+    g_ui.close_popover();
     set_status(L"Saving");
     logw("UI", L"saving " + std::to_wstring(jobs.size()) + L" scan(s) as " + format_extension(f) + L" to " + path);
-    std::thread([jobs, f, path, opt]() {
+    std::thread([jobs, targets, f, path, opt]() {
         prepare_thread_for_crash_logging("save");
         auto* result = new TaskResult();
         std::wstring err;
@@ -761,34 +835,27 @@ void save_pages(bool all)
         double needed = 0, free_mb = 0;
         bool ok = true;
         size_t count = 0;
+        std::wstring failed_path = path;
         // every error in this thread must be caught: an escaping exception would close the app
         try {
-            if (format_multipage(f) || jobs.size() == 1) {
+            if (targets.size() == 1) {
                 std::vector<Image> processed;
                 processed.reserve(jobs.size());
-                for (auto& j : jobs) processed.push_back(apply_adjustments(*j.first, j.second, 1.0));
+                for (auto& j : jobs) processed.push_back(apply_adjustments(j.page->raw, j.adj, 1.0));
                 std::vector<const Image*> ptrs;
                 for (auto& p : processed) ptrs.push_back(&p);
                 ok = write_document(path, f, ptrs, opt, err, &code, &needed, &free_mb);
                 count = ok ? processed.size() : 0;
             } else {
-                std::wstring base = path, ext;
-                size_t dot = path.find_last_of(L'.');
-                if (dot != std::wstring::npos && (path.find_last_of(L"\\/") == std::wstring::npos ||
-                                                  dot > path.find_last_of(L"\\/"))) {
-                    base = path.substr(0, dot);
-                    ext = path.substr(dot);
-                }
                 for (size_t i = 0; i < jobs.size() && ok; ++i) {
-                    wchar_t num[16];
-                    swprintf(num, 16, L"_%03zu", i + 1);
-                    Image one = apply_adjustments(*jobs[i].first, jobs[i].second, 1.0);  // one at a time
-                    ok = write_document(base + num + ext, f, {&one}, opt, err, &code, &needed, &free_mb);
+                    Image one = apply_adjustments(jobs[i].page->raw, jobs[i].adj, 1.0);  // one at a time
+                    failed_path = targets[i];
+                    ok = write_document(targets[i], f, {&one}, opt, err, &code, &needed, &free_mb);
                     if (ok) ++count;
                 }
             }
             if (!ok) result->problem = code == ERROR_NOT_ENOUGH_MEMORY ? problem_save_memory(needed)
-                                                                        : problem_save(code, path, needed, free_mb, err);
+                                                                        : problem_save(code, failed_path, needed, free_mb, err);
         } catch (const std::bad_alloc&) {
             ok = false;
             result->problem = problem_save_memory(0);
@@ -799,14 +866,58 @@ void save_pages(bool all)
             ok = false;
             result->problem = problem_unexpected("while saving", "unknown error");
         }
-        if (ok) logw("INFO", L"saved " + std::to_wstring(count) + L" scan(s) to " + path);
-        else logw("ERROR", L"saving to " + path + L" failed (Windows error " + std::to_wstring(code) + L"): " + err);
-        if (!ok && count > 0)
+        if (ok) logw("INFO", L"saved " + std::to_wstring(count) + L" scan(s) to " +
+                              (targets.size() == 1 ? path : targets.front() + L" ... " + file_name_of(targets.back())));
+        else logw("ERROR", L"saving to " + failed_path + L" failed (Windows error " + std::to_wstring(code) + L"): " + err);
+        if (!ok && count > 0 && targets.size() > 1)
             result->problem.what += L" The first " + std::to_wstring(count) + L" file(s) were saved.";
         result->ok = ok;
-        result->message = L"Saved " + path.substr(path.find_last_of(L"\\/") + 1);
+        if (targets.size() == 1) result->message = L"Saved " + file_name_of(path);
+        else result->message = L"Saved " + std::to_wstring(targets.size()) + L" files: " + file_name_of(targets.front()) +
+                               L" to " + file_name_of(targets.back());
         if (!PostMessageW(g_main, WM_SAVE_DONE, 0, reinterpret_cast<LPARAM>(result))) delete result;
     }).detach();
+}
+
+void save_pages(bool all)
+{
+    if (g_pages.empty() || g_saving) return;
+    LOG_UI("clicked '%s'", all ? "Save all" : "Save scan");
+    g_ui.close_popover();
+    g_last_save_all = all;
+    std::vector<std::shared_ptr<Page>> pages;
+    if (all) {
+        pages = g_pages;
+    } else {
+        int i = g_selected >= 0 && g_selected < static_cast<int>(g_pages.size()) ? g_selected
+                                                                                   : static_cast<int>(g_pages.size()) - 1;
+        pages.push_back(g_pages[static_cast<size_t>(i)]);
+    }
+    OutFormat f = ui_format();
+    std::wstring path;
+    if (!ask_save_path(f, timestamp_name(), path, pages.size() > 1 && !format_multipage(f))) return;
+
+    // One file per scan: the dialog can't ask about the numbered names, so ask here.
+    const std::vector<std::wstring> targets = save_targets(path, f, pages.size());
+    if (targets.size() > 1) {
+        size_t existing = 0;
+        std::wstring first;
+        for (auto& t : targets)
+            if (GetFileAttributesW(t.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                if (existing++ == 0) first = file_name_of(t);
+            }
+        if (existing > 0) {
+            std::wstring msg = existing == 1 ? first + L" already exists in that folder."
+                                             : std::to_wstring(existing) + L" of the files (" + first +
+                                                   L" and others) already exist in that folder.";
+            g_ui.alert(L"Replace existing files?", msg + L" Each scan is saved as its own numbered file.",
+                       {L"Cancel", L"Replace"}, [pages, f, path](int b) { if (b == 1) launch_save(pages, f, path); },
+                       0, 0);
+            redraw();
+            return;
+        }
+    }
+    launch_save(std::move(pages), f, path);
 }
 
 // ---------------------------------------------------------- elevation
@@ -869,12 +980,29 @@ void run_access_setup(bool remove)
     }).detach();
 }
 
+// Runs with administrator rights. The result text goes to a file in the starting user's
+// temporary folder, which other programs can write to, so it is only ever created as a
+// brand-new ordinary file: never an existing file, and never through a link.
 int run_elevated_helper(bool remove, const std::wstring& result_file)
 {
     std::wstring msg;
     bool ok = remove ? usb_unbind_winusb(msg) : usb_bind_winusb(msg);
-    FILE* f = _wfopen(result_file.c_str(), L"wt, ccs=UTF-16LE");
-    if (f) { fputws(msg.c_str(), f); fclose(f); }
+    HANDLE h = CreateFileW(result_file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        LOG_WARN("elevated helper: the result file could not be created (Windows error %lu); the app will "
+                 "use the exit code only", static_cast<unsigned long>(GetLastError()));
+    } else {
+        // UTF-16 with a byte-order mark; line ends as the reader's text mode expects
+        std::wstring out = L"\xFEFF";
+        for (wchar_t c : msg) {
+            if (c == L'\n') out += L'\r';
+            out += c;
+        }
+        DWORD written = 0;
+        WriteFile(h, out.data(), static_cast<DWORD>(out.size() * sizeof(wchar_t)), &written, nullptr);
+        CloseHandle(h);
+    }
     return ok ? 0 : 1;
 }
 
@@ -884,6 +1012,9 @@ void delete_selected_page()
 {
     if (!selected_page() || g_saving) return;
     LOG_UI("deleted scan %d", g_pages[static_cast<size_t>(g_selected)]->number);
+    g_ui.forget("card." + std::to_string(g_pages[static_cast<size_t>(g_selected)]->number));
+    g_pages[static_cast<size_t>(g_selected)]->gi_display.release();
+    g_pages[static_cast<size_t>(g_selected)]->gi_thumb.release();
     g_pages.erase(g_pages.begin() + g_selected);
     if (g_pages.empty()) {
         g_selected = -1;
@@ -914,11 +1045,15 @@ void set_theme(bool dark)
 
 void show_about()
 {
-    g_ui.alert(L"LiDE50 Scan 1.4",
+    g_ui.alert(L"LiDE50 Scan 1.45",
                L"Portable scanning for the Canon CanoScan LiDE 50 on 64-bit Windows. The scanner driver is built "
                L"in and talks to the scanner through Windows' own WinUSB driver, so nothing else needs installing.\n\n"
                L"Built on the SANE genesys backend (GPL-2.0-or-later), libusb (LGPL-2.1), miniz (MIT) and "
-               L"stb_image_write (public domain). LiDE50 Scan is free software under the GNU GPL v2 or later. "
+               L"stb_image_write (public domain).\n\n"
+               L"Copyright (C) 2026 the LiDE50 Scan contributors and the authors of the projects above. "
+               L"LiDE50 Scan is free software under the GNU General Public License, version 2 or later: you "
+               L"may share and change it under that licence. It comes with ABSOLUTELY NO WARRANTY. See the "
+               L"COPYING file for details.\n\n"
                L"Canon and CanoScan are trademarks of Canon Inc.; this app is not affiliated with Canon.",
                {L"OK"}, nullptr);
 }
@@ -932,7 +1067,14 @@ void open_more_menu(const RectF& anchor)
                      g_ui.alert(L"Clear all scans?", L"Scans you haven't saved will be lost.",
                                 {L"Keep them", L"Clear all"}, [](int b) {
                                     if (b != 1) return;
+                                    if (g_saving) {
+                                        g_ui.toast(L"Still saving. Clear the scans when it's done.", 2);
+                                        return;
+                                    }
                                     LOG_UI("cleared all scans");
+                                    for (auto& pg : g_pages) g_ui.forget("card." + std::to_string(pg->number));
+                                    // free the GPU copies here, on the window's thread
+                                    for (auto& pg : g_pages) { pg->gi_display.release(); pg->gi_thumb.release(); }
                                     g_pages.clear();
                                     g_selected = -1;
                                     show_glass();
@@ -965,12 +1107,13 @@ void open_more_menu(const RectF& anchor)
                  }});
     m.push_back({L"", Icon::Check, false, false, nullptr, true});
     m.push_back({L"Open the log file", Icon::Doc, true, true, [] {
-                     ShellExecuteW(g_main, L"open", L"notepad.exe", (L"\"" + log_path() + L"\"").c_str(), nullptr,
-                                   SW_SHOWNORMAL);
+                     ShellExecuteW(g_main, L"open", system_file(L"notepad.exe").c_str(),
+                                   (L"\"" + log_path() + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
                  }});
     m.push_back({L"Show the log in its folder", Icon::Layers, true, true, [] {
                      std::wstring args = L"/select,\"" + log_path() + L"\"";
-                     ShellExecuteW(g_main, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+                     ShellExecuteW(g_main, L"open", windows_file(L"explorer.exe").c_str(), args.c_str(), nullptr,
+                                   SW_SHOWNORMAL);
                  }});
     m.push_back({L"Open the settings folder", Icon::Layers, true, true, [] {
                      ShellExecuteW(g_main, L"open", g_data_dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -1032,7 +1175,7 @@ void on_engine_event(EngineEvent e, const std::string& text)
                 g_view = View::Glass;
                 g_ui.toast(L"Preview ready. Drag on the glass to choose what to scan.", 1);
             } else {
-                auto p = std::make_unique<Page>();
+                auto p = std::make_shared<Page>();
                 p->raw = std::move(img);
                 p->adj = g_default_adj;
                 p->number = ++g_page_counter;
@@ -2093,21 +2236,26 @@ LRESULT main_proc_impl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 // so every message is handled inside a guard.
 LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    Problem failure;
     try {
         return main_proc_impl(hwnd, msg, wp, lp);
     } catch (const std::bad_alloc&) {
         LOG_ERROR("window message 0x%04x: out of memory", msg);
-        g_rendering = false;
-        if (g_main) show_problem(problem_not_enough_memory(0, 0, false));
+        try { failure = problem_not_enough_memory(0, 0, false); } catch (...) {}
     } catch (const std::exception& e) {
         LOG_ERROR("window message 0x%04x failed: %s", msg, e.what());
         log_stack_trace("stack at the time of the error:");
-        g_rendering = false;
-        if (g_main) show_problem(problem_unexpected("in the window", e.what()));
+        try { failure = problem_unexpected("in the window", e.what()); } catch (...) {}
     } catch (...) {
         LOG_ERROR("window message 0x%04x failed with an unknown error", msg);
-        g_rendering = false;
-        if (g_main) show_problem(problem_unexpected("in the window", "unknown error"));
+        try { failure = problem_unexpected("in the window", "unknown error"); } catch (...) {}
+    }
+    g_rendering = false;
+    // showing the message can fail too (it needs memory); that must stay inside this function
+    try {
+        if (g_main) show_problem(failure);
+    } catch (...) {
+        LOG_ERROR("could not show the error message");
     }
     return msg == WM_CREATE ? -1 : 0;
 }
@@ -2223,7 +2371,8 @@ LRESULT main_proc_impl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             break;
         case WM_COMMAND:
-            if (ui.modal_open()) return 0;
+            // keyboard shortcuts wait while an alert or a menu is open
+            if (ui.modal_open() || ui.popover_open()) return 0;
             switch (LOWORD(wp)) {
                 case ID_PREVIEW: start_scan(true); break;
                 case ID_SCAN: start_scan(false); break;
@@ -2287,7 +2436,7 @@ LRESULT main_proc_impl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_saving = false;
             g_status.clear();
             if (r->ok) ui.toast(r->message, 1);
-            else show_problem(r->problem, [] { save_pages(false); });
+            else show_problem(r->problem, [] { save_pages(g_last_save_all); });
             redraw();
             return 0;
         }
@@ -2329,6 +2478,8 @@ LRESULT main_proc_impl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
 {
+    // before anything else can load a DLL: Windows' DLLs come from System32 only
+    sysdll_restrict_search();
     g_inst = inst;
     QueryPerformanceFrequency(&g_qpf);
     QueryPerformanceCounter(&g_qp0);

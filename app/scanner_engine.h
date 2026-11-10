@@ -1,6 +1,8 @@
 // LiDE50 Scan - scanner engine. Owns all access to the bundled Canon LiDE 50
 // driver (SANE genesys/GL841 code running in user space over WinUSB).
 // All driver calls happen on one worker thread.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 the LiDE50 Scan contributors
 #pragma once
 
 #include "image.h"
@@ -73,8 +75,8 @@ public:
     bool connected() const { return connected_; }
     bool busy() const { return busy_; }
     bool parking() const { return parking_; }
-    double bed_width_mm() const { return bed_w_; }
-    double bed_height_mm() const { return bed_h_; }
+    double bed_width_mm() const { return bed_w_.load(); }
+    double bed_height_mm() const { return bed_h_.load(); }
     bool simulated() const { return simulate_; }
 
     ScanProgress& progress() { return progress_; }
@@ -114,7 +116,7 @@ private:
     bool fake_usb_ = false;
     bool sane_inited_ = false;
     void* handle_ = nullptr;
-    double bed_w_ = 216.0, bed_h_ = 297.0;
+    std::atomic<double> bed_w_{216.0}, bed_h_{297.0};   // set by the scanner thread, read by the window
     int button_fail_count_ = 0;
 
     ScanProgress progress_;

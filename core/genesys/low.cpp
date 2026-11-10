@@ -3,6 +3,10 @@
    Copyright (C) 2010-2013 Stéphane Voltz <stef.dev@free.fr>
 
 
+   Modified for LiDE50 Scan (https://github.com/ifloofie/LiDE50-scanner):
+   2026-10-12  create_cmd_set() only creates the GL841 command set; the other chips' command
+               sets (gl124, gl646, gl842, gl843, gl846, gl847 .cpp files) are not included.
+
    This file is part of the SANE package.
 
    This program is free software; you can redistribute it and/or

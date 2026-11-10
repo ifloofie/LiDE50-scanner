@@ -3,6 +3,8 @@
 // Everything that happens from startup to the end of a scan is written to
 // LiDE50Scan.log next to the executable (created if missing). Lines are written
 // straight to the file (no buffering), so the log survives a crash.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 the LiDE50 Scan contributors
 #pragma once
 
 #include <string>

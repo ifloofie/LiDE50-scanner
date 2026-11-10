@@ -1,5 +1,7 @@
 // LiDE50 Scan - Direct2D / DirectWrite drawing layer. All coordinates are in
 // device-independent pixels (1/96 inch).
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 the LiDE50 Scan contributors
 #pragma once
 
 #include <windows.h>

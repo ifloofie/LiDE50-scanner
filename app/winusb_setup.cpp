@@ -1,12 +1,16 @@
 // LiDE50 Scan - WinUSB binding for the Canon LiDE 50.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 the LiDE50 Scan contributors
 #include "winusb_setup.h"
 #include "log.h"
+#include "sysdll.h"
 
 #include <windows.h>
 #include <cfgmgr32.h>
 #include <setupapi.h>
 #include <newdev.h>
 #include <initguid.h>
+#include <sddl.h>
 
 #include <cstring>
 #include <cwchar>
@@ -121,7 +125,7 @@ bool install_from_list(HDEVINFO devs, SP_DEVINFO_DATA& did, DWORD list_type, std
         return false;
     }
 
-    HMODULE newdev = LoadLibraryW(L"newdev.dll");
+    HMODULE newdev = sysdll_load(L"newdev.dll");
     auto install = newdev ? reinterpret_cast<DiInstallDeviceFn>(GetProcAddress(newdev, "DiInstallDevice")) : nullptr;
     if (!install) {
         why = L"DiInstallDevice is not available on this version of Windows.";
@@ -143,13 +147,43 @@ bool install_from_list(HDEVINFO devs, SP_DEVINFO_DATA& did, DWORD list_type, std
 // Last resort: an INF that only references Windows' own WinUSB driver for this
 // one hardware ID. It has no catalog, so Windows shows its "can't verify the
 // publisher" prompt; no third-party driver binaries are involved.
+//
+// This runs with administrator rights, so the file must not be somewhere another program
+// could swap it before Windows reads it: it goes into a new folder under the Windows
+// folder that only administrators and the system can open, and is removed afterwards.
 bool install_with_inf(std::wstring& why)
 {
-    wchar_t tmp[MAX_PATH] = {};
-    GetTempPathW(MAX_PATH, tmp);
-    std::wstring dir = std::wstring(tmp) + L"lide50scan_inf";
-    CreateDirectoryW(dir.c_str(), nullptr);
+    wchar_t windir[MAX_PATH] = {};
+    UINT wn = GetWindowsDirectoryW(windir, MAX_PATH);
+    if (wn == 0 || wn >= MAX_PATH) {
+        why = L"Could not find the Windows folder.";
+        return false;
+    }
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    // protected ACL: full access for Administrators and SYSTEM, nobody else, nothing inherited
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)", SDDL_REVISION_1,
+                                                              &sd, nullptr)) {
+        why = L"Could not prepare the setup folder: " + last_error_text(GetLastError());
+        return false;
+    }
+    SECURITY_ATTRIBUTES sa{sizeof(sa), sd, FALSE};
+    wchar_t unique[64];
+    swprintf(unique, 64, L"\\Temp\\LiDE50Scan-setup-%lu-%lu", static_cast<unsigned long>(GetCurrentProcessId()),
+             static_cast<unsigned long>(GetTickCount()));
+    std::wstring dir = std::wstring(windir) + unique;
+    // must be a folder we create ourselves: an existing one could have been prepared by someone else
+    BOOL made = CreateDirectoryW(dir.c_str(), &sa);
+    DWORD made_err = GetLastError();
+    LocalFree(sd);
+    if (!made) {
+        why = L"Could not create the setup folder: " + last_error_text(made_err);
+        return false;
+    }
     std::wstring inf = dir + L"\\lide50_winusb.inf";
+    struct Cleanup {
+        std::wstring file, folder;
+        ~Cleanup() { DeleteFileW(file.c_str()); RemoveDirectoryW(folder.c_str()); }
+    } cleanup{inf, dir};
     const char* text =
         "[Version]\r\n"
         "Signature = \"$Windows NT$\"\r\n"
@@ -185,17 +219,23 @@ bool install_with_inf(std::wstring& why)
         "Provider = \"LiDE50 Scan\"\r\n"
         "Mfg = \"Canon\"\r\n"
         "DeviceName = \"CanoScan LiDE 50 (WinUSB)\"\r\n";
-    HANDLE f = CreateFileW(inf.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE f = CreateFileW(inf.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) {
         why = L"Could not write the setup file: " + last_error_text(GetLastError());
         return false;
     }
     DWORD written = 0;
-    WriteFile(f, text, static_cast<DWORD>(strlen(text)), &written, nullptr);
+    const DWORD len = static_cast<DWORD>(strlen(text));
+    BOOL wrote = WriteFile(f, text, len, &written, nullptr);
+    DWORD write_err = GetLastError();
     CloseHandle(f);
+    if (!wrote || written != len) {
+        why = L"Could not write the setup file: " + last_error_text(write_err);
+        return false;
+    }
 
     using UpdateFn = BOOL(WINAPI*)(HWND, LPCWSTR, LPCWSTR, DWORD, PBOOL);
-    HMODULE newdev = LoadLibraryW(L"newdev.dll");
+    HMODULE newdev = sysdll_load(L"newdev.dll");
     auto update = newdev ? reinterpret_cast<UpdateFn>(GetProcAddress(newdev, "UpdateDriverForPlugAndPlayDevicesW")) : nullptr;
     if (!update) {
         why = L"UpdateDriverForPlugAndPlayDevices is not available.";
@@ -252,6 +292,9 @@ bool usb_bind_winusb(std::wstring& message)
     }
     if (!ok) {
         // Move the device into the "Universal Serial Bus devices" class and retry.
+        // If that doesn't work either, the device gets its previous class back.
+        std::wstring old_class;
+        const bool had_class = get_string_prop(devs, &did, SPDRP_CLASSGUID, old_class) && !old_class.empty();
         const wchar_t* cls = L"{88BAE032-5A81-49F0-BC3D-A4FF138216D6}";
         SetupDiSetDeviceRegistryPropertyW(devs, &did, SPDRP_CLASSGUID,
                                           reinterpret_cast<const BYTE*>(cls),
@@ -262,6 +305,14 @@ bool usb_bind_winusb(std::wstring& message)
             LOG_INFO("access setup: attempt 3 (moved device to the USB device class)");
             ok = install_from_list(devs, did, SPDIT_CLASSDRIVER, why3);
             logw(ok ? "INFO" : "WARN", L"access setup: attempt 3 " + std::wstring(ok ? L"succeeded " : L"failed: ") + why3);
+            if (!ok) {
+                // put the class back the way it was (an empty value removes the property)
+                const BOOL restored = SetupDiSetDeviceRegistryPropertyW(
+                    devs, &did, SPDRP_CLASSGUID,
+                    had_class ? reinterpret_cast<const BYTE*>(old_class.c_str()) : nullptr,
+                    had_class ? static_cast<DWORD>((old_class.size() + 1) * sizeof(wchar_t)) : 0);
+                LOG_INFO("access setup: device class %s", restored ? "restored" : "could not be restored");
+            }
         }
     }
     if (devs != INVALID_HANDLE_VALUE) SetupDiDestroyDeviceInfoList(devs);

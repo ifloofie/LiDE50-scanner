@@ -2,6 +2,8 @@
 // Canon LiDE 50 (USB 04A9:2213), so the app can talk to the scanner directly.
 // No third-party driver files are installed: winusb.inf ships with Windows
 // and is signed by Microsoft.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 the LiDE50 Scan contributors
 #pragma once
 #include <string>
 

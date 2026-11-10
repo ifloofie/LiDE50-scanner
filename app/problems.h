@@ -4,6 +4,8 @@
 // a sentence or two on what happened, numbered steps to fix it, and technical
 // details for "Copy details". The engine, saving and setup code build these;
 // the window shows them with show_problem().
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 the LiDE50 Scan contributors
 #pragma once
 
 #include <string>

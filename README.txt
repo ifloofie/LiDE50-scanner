@@ -1,4 +1,4 @@
-LiDE50 Scan 1.4 - portable scanning for the Canon CanoScan LiDE 50
+LiDE50 Scan 1.45 - portable scanning for the Canon CanoScan LiDE 50
 =====================================================================
 
 For 64-bit Windows 10 and 11. One file, no installer: LiDE50Scan.exe.
@@ -158,10 +158,12 @@ Common cases:
 
 LICENSES
 --------
-LiDE50 Scan is free software under the GNU General Public License v2 or
-later (see COPYING). It contains:
+Copyright (C) 2026 the LiDE50 Scan contributors and the authors of the
+projects below. LiDE50 Scan is free software under the GNU General Public
+License v2 or later (see COPYING) and comes with ABSOLUTELY NO WARRANTY.
+It contains:
   - the SANE genesys backend (GL841 / LiDE 50), GPL-2.0-or-later
-  - libusb 1.0.27, LGPL-2.1-or-later
+  - libusb 1.0.30, LGPL-2.1-or-later
   - miniz (MIT) and stb_image_write (public domain)
 The complete source code is in LiDE50Scan-source.zip and at
 https://github.com/ifloofie/LiDE50-scanner (credits with links to each

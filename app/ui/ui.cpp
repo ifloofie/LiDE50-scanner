@@ -1,4 +1,6 @@
 // LiDE50 Scan - immediate-mode "liquid glass" widget toolkit.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 the LiDE50 Scan contributors
 #include "ui.h"
 
 #include <algorithm>
@@ -176,6 +178,15 @@ float Ui::anim(const std::string& key, float target, float speed)
 }
 
 void Ui::set_anim(const std::string& key, float v) { anims_[key] = v; }
+
+void Ui::forget(const std::string& prefix)
+{
+    const std::string p = prefix + ".";
+    for (auto it = anims_.begin(); it != anims_.end();)
+        it = it->first.compare(0, p.size(), p) == 0 ? anims_.erase(it) : ++it;
+    for (auto it = springs_.begin(); it != springs_.end();)
+        it = it->first.compare(0, p.size(), p) == 0 ? springs_.erase(it) : ++it;
+}
 
 void Ui::set_spring(const std::string& key, float v)
 {

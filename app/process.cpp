@@ -1,4 +1,6 @@
 // LiDE50 Scan - image adjustments.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 the LiDE50 Scan contributors
 #include "process.h"
 
 #include <algorithm>
@@ -29,7 +31,6 @@ Image box_blur(const Image& src, int r, int passes = 2)
     Image a = src, b = src;
     const int w = src.width, h = src.height, c = src.channels;
     const int win = 2 * r + 1;
-    std::vector<int> acc(static_cast<size_t>(c));
     for (int p = 0; p < passes; ++p) {
         // horizontal a -> b
         for (int y = 0; y < h; ++y) {
@@ -45,16 +46,20 @@ Image box_blur(const Image& src, int r, int passes = 2)
                 }
             }
         }
-        // vertical b -> a
+        // vertical b -> a. The window sum of every column is kept in `col`, so the image is
+        // read and written row by row (walking it column by column is far slower on big scans).
         const size_t stride = b.stride();
-        for (int x = 0; x < w * c; ++x) {
-            int s = 0;
-            for (int i = -r; i <= r; ++i) s += b.data[std::clamp(i, 0, h - 1) * stride + x];
-            for (int y = 0; y < h; ++y) {
-                a.data[y * stride + x] = static_cast<std::uint8_t>(s / win);
-                int add = std::min(y + r + 1, h - 1), sub = std::max(y - r, 0);
-                s += b.data[add * stride + x] - b.data[sub * stride + x];
-            }
+        std::vector<int> col(stride, 0);
+        for (int i = -r; i <= r; ++i) {
+            const std::uint8_t* row = b.row(std::clamp(i, 0, h - 1));
+            for (size_t x = 0; x < stride; ++x) col[x] += row[x];
+        }
+        for (int y = 0; y < h; ++y) {
+            std::uint8_t* out = a.row(y);
+            for (size_t x = 0; x < stride; ++x) out[x] = static_cast<std::uint8_t>(col[x] / win);
+            const std::uint8_t* add = b.row(std::min(y + r + 1, h - 1));
+            const std::uint8_t* sub = b.row(std::max(y - r, 0));
+            for (size_t x = 0; x < stride; ++x) col[x] += add[x] - sub[x];
         }
     }
     return a;
@@ -137,21 +142,6 @@ Image downscale(const Image& src, int max_side)
             for (int k = 0; k < c; ++k) out_row[x * c + k] = static_cast<std::uint8_t>(acc[x * c + k] / cnt);
         }
     }
-    return out;
-}
-
-Image crop(const Image& src, int x, int y, int w, int h)
-{
-    x = std::clamp(x, 0, std::max(0, src.width - 1));
-    y = std::clamp(y, 0, std::max(0, src.height - 1));
-    w = std::clamp(w, 1, src.width - x);
-    h = std::clamp(h, 1, src.height - y);
-    Image out;
-    out.alloc(w, h, src.channels);
-    out.dpi = src.dpi;
-    out.bilevel = src.bilevel;
-    for (int r = 0; r < h; ++r)
-        std::memcpy(out.row(r), src.row(y + r) + static_cast<size_t>(x) * src.channels, out.stride());
     return out;
 }
 
