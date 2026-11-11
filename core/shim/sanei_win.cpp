@@ -188,9 +188,15 @@ struct FakeGl841 {
         }
     };
 
+    // LED on-time of one colour. It can't be longer than the line period (LPERIOD, 0x38/0x39)
+    // less the dummy period (0x19): past that the LED is on for the whole line and a larger
+    // exposure value gives no more light.
     unsigned exposure(int colour) const
     {
-        return (static_cast<unsigned>(regs[0x10 + colour * 2]) << 8) | regs[0x11 + colour * 2];
+        unsigned e = (static_cast<unsigned>(regs[0x10 + colour * 2]) << 8) | regs[0x11 + colour * 2];
+        unsigned lperiod = (static_cast<unsigned>(regs[0x38]) << 8) | regs[0x39];
+        unsigned longest = lperiod > regs[0x19] ? lperiod - regs[0x19] : 0;
+        return longest ? std::min(e, longest) : e;
     }
 
     // 16-bit level for one colour (0 R, 1 G, 2 B, 3 = all LEDs added for gray)

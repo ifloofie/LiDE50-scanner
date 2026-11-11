@@ -724,11 +724,15 @@ void ScannerEngine::do_scan(const ScanRequest& req)
         const Lide50CalibReport& c = *lide50_diag_calib();
         if (c.ran)
             LOG_INFO("engine: calibration: LED %s after %d tries, brightness %u/%u/%u (target %u), exposure "
-                     "%u/%u/%u, white strip %u/%u/%u%s%s",
+                     "%u/%u/%u, white strip %u/%u/%u%s%s%s",
                      c.led_result == LIDE50_LED_OK ? "settled" : c.led_result == LIDE50_LED_UNSETTLED ? "DID NOT SETTLE" : "not run",
                      c.led_tries, c.led_average[0], c.led_average[1], c.led_average[2], c.led_target,
                      c.led_exposure[0], c.led_exposure[1], c.led_exposure[2], c.white_level[0], c.white_level[1],
-                     c.white_level[2], c.reset_bad_exposure ? ", reset an out-of-range exposure" : "",
+                     c.white_level[2],
+                     c.led_limit_channel == 0 ? ", the red LED is weak (at its longest exposure; compensated)"
+                     : c.led_limit_channel == 1 ? ", the green LED is weak (at its longest exposure; compensated)"
+                     : c.led_limit_channel == 2 ? ", the blue LED is weak (at its longest exposure; compensated)" : "",
+                     c.reset_bad_exposure ? ", reset an out-of-range exposure" : "",
                      c.cache_rejected ? ", ignored an invalid cached calibration" : "");
     }
     if (st != SANE_STATUS_GOOD) {
