@@ -34,6 +34,9 @@ the backend's virtual LiDE 50 (no hardware needed), and "--log" for a USB trace.
 (core/shim/sanei_win.cpp). Its sensor follows the LED exposure registers like the
 real one. Test settings (environment variables):
   LIDE50_FAKE_LED=<r>,<g>,<b>   brightness per exposure unit (default 24,24,24;
+                                24,3.92,24 = weak green LED as in issue #1: settles at the
+                                longest exposure (0x1400) with about 81% of the target;
+                                24,1,24 = too weak, gives CAL-COLOUR;
                                 24,24,0 = dead blue LED; "flat" = ignore exposure)
   LIDE50_FAKE_AMBIENT=<n>       stray light added to every colour (50000 = lid open)
   LIDE50_FAKE_DATA=<0..255>     every byte constant (0 = no light at all)

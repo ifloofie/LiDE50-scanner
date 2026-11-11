@@ -298,8 +298,8 @@ struct Genesys_Device
     // LiDE50 Scan: the sensor table's LED exposure when the scanner was opened. Used to
     // reset a calibrated exposure that is out of the safe range.
     SensorExposure lide50_default_exposure{0x400, 0x400, 0x400};
-    // LiDE50 Scan: the last LED calibration did not settle. Its exposure was used for that
-    // scan only; the next LED calibration starts from the default again.
+    // LiDE50 Scan: the last LED calibration did not settle. The next LED calibration starts
+    // from the default again instead of from its result.
     bool lide50_led_unsettled = false;
 
     // for sheetfed scanner's, is TRUE when there is a document in the scanner

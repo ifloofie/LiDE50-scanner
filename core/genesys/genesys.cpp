@@ -23,6 +23,10 @@
                lide50_diag.h.
    2026-11-10  An unsettled LED exposure is no longer the starting point of the next
                calibration; gray mode reports low light as "all colours".
+   2026-11-12  LED calibration: the longest exposure stays below the calibration line
+               period (0x1400); a weak LED that reaches at least half the target at that
+               exposure counts as settled; the result is written to every sensor entry so
+               gain, shading and the scan all use the same exposures.
 
    This file is part of the SANE package.
 
@@ -2231,8 +2235,38 @@ SensorExposure scanner_led_calibration(Genesys_Device& dev, const Genesys_Sensor
         for (unsigned i = 0; i < 3; i++) {
             report->led_average[i] = static_cast<unsigned>(std::max(0, last_avg[i]));
         }
+        // A colour whose LED has grown weak can't reach the target even at the longest
+        // exposure. That is fine as long as it still gives a good share of the target: the
+        // analog gain and the shading correction that follow are measured with these same
+        // exposures and make up the difference. Only if every colour that is off target is
+        // such a case does the calibration count as settled.
+        bool weak_only = !acceptable;
+        int weak_channel = -1;
+        for (unsigned i = 0; i < 3 && !acceptable; i++) {
+            const int low = static_cast<int>(target) - static_cast<int>(target / 50);
+            const int high = static_cast<int>(target) + static_cast<int>(target / 50);
+            if (last_avg[i] >= low && last_avg[i] <= high) {
+                continue;
+            }
+            const bool at_max = exp[i] >= LIDE50_LED_EXPOSURE_MAX;
+            const bool usable = last_avg[i] < low &&
+                static_cast<unsigned>(std::max(0, last_avg[i])) * 100u >= target * LIDE50_LED_LIMIT_OK_PERCENT;
+            if (at_max && usable) {
+                if (weak_channel < 0) {
+                    weak_channel = static_cast<int>(i);
+                }
+            } else {
+                weak_only = false;
+            }
+        }
         if (acceptable) {
             report->led_result = LIDE50_LED_OK;
+        } else if (weak_only && weak_channel >= 0) {
+            report->led_result = LIDE50_LED_OK;
+            report->led_limit_channel = weak_channel;
+            DBG(DBG_error0, "LED calibration: colour %d is weak, %d of %d at the longest exposure %d; "
+                "gain and shading compensate\n", weak_channel, last_avg[weak_channel], target,
+                exp[weak_channel]);
         } else {
             report->led_result = LIDE50_LED_UNSETTLED;
             for (unsigned i = 0; i < 3; i++) {
@@ -3752,19 +3786,20 @@ static void genesys_flatbed_calibration(Genesys_Device* dev, Genesys_Sensor& sen
             case AsicType::GL846:
             case AsicType::GL847: {
                 auto calib_exposure = dev->cmd_set->led_calibration(dev, sensor, local_reg);
-                // LiDE50 Scan: only a calibration that settled becomes the starting point for
-                // later scans; an unsettled one is used for this scan only
-                if (lide50_diag_calib()->led_result != LIDE50_LED_UNSETTLED) {
-                    for (auto& sensor_update :
-                            sanei_genesys_find_sensors_all_for_write(dev, sensor.method)) {
-                        sensor_update.get().exposure = calib_exposure;
-                    }
-                    dev->lide50_led_unsettled = false;
-                } else {
-                    // `sensor` below is this resolution's table entry, so it keeps the unsettled
-                    // value until the next LED calibration, which then restarts from the default
-                    dev->lide50_led_unsettled = true;
+                // LiDE50 Scan: the result goes into every sensor entry, settled or not. The
+                // offset, gain and shading calibrations that follow use the entry for the
+                // shading resolution (600 dpi), the scan uses the entry for its own
+                // resolution, and all of them must run with the same LED exposures. (1.4 kept
+                // an unsettled result in the scan's entry only: gain and shading were then
+                // measured with other exposures than the scan used, which gave a strong
+                // colour cast, typically green, at every resolution except 600 dpi.)
+                // An unsettled result is still never cached, and the next LED calibration
+                // restarts from the default instead of from it.
+                for (auto& sensor_update :
+                        sanei_genesys_find_sensors_all_for_write(dev, sensor.method)) {
+                    sensor_update.get().exposure = calib_exposure;
                 }
+                dev->lide50_led_unsettled = lide50_diag_calib()->led_result == LIDE50_LED_UNSETTLED;
                 sensor.exposure = calib_exposure;
                 break;
             }
