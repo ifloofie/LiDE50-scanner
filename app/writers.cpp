@@ -3,6 +3,7 @@
 // Copyright (C) 2026 the LiDE50 Scan contributors
 #include "writers.h"
 #include "encoders.h"
+#include "progress.h"
 
 #include <windows.h>
 
@@ -75,7 +76,7 @@ bool write_file(const std::wstring& path, const Bytes& data, std::wstring& error
     bool ok = true;
     size_t done = 0;
     while (ok && done < data.size()) {
-        DWORD chunk = static_cast<DWORD>(std::min<size_t>(data.size() - done, 64u * 1024u * 1024u));
+        DWORD chunk = static_cast<DWORD>(std::min<size_t>(data.size() - done, 8u * 1024u * 1024u));
         DWORD written = 0;
         if (!WriteFile(h, data.data() + done, chunk, &written, nullptr) || written != chunk) {
             we.code = GetLastError();
@@ -84,6 +85,7 @@ bool write_file(const std::wstring& path, const Bytes& data, std::wstring& error
             break;
         }
         done += written;
+        progress(0.9 * static_cast<double>(done) / static_cast<double>(data.size()));   // flushing is the rest
     }
     if (ok && !FlushFileBuffers(h)) {
         we.code = GetLastError();
@@ -142,6 +144,24 @@ bool format_multipage(OutFormat f)
     return f == OutFormat::PDF || f == OutFormat::DOCX || f == OutFormat::TIFF;
 }
 
+namespace {
+const double kWriteCost = 0.5;   // writing the file to disk
+double encode_only_cost(OutFormat f, const SaveOptions& opt)
+{
+    switch (f) {
+        case OutFormat::PNG: return 10.0;
+        case OutFormat::TIFF: return 5.0;
+        case OutFormat::BMP: return 1.0;
+        case OutFormat::JPEG: return 3.0;
+        case OutFormat::DOCX: return 3.0;
+        case OutFormat::PDF: return opt.pdf_lossless ? 6.0 : 3.0;
+    }
+    return 3.0;
+}
+} // namespace
+
+double encode_cost(OutFormat f, const SaveOptions& opt) { return encode_only_cost(f, opt) + kWriteCost; }
+
 bool write_document(const std::wstring& path, OutFormat f, const std::vector<const Image*>& pages,
                     const SaveOptions& opt, std::wstring& error, unsigned long* win32_error, double* needed_mb,
                     double* free_mb)
@@ -176,6 +196,8 @@ bool write_document(const std::wstring& path, OutFormat f, const std::vector<con
                                               L"Save fewer scans per file or use PDF.");
     }
     Bytes data;
+    ProgressParts parts(encode_cost(f, opt));
+    parts.next(encode_only_cost(f, opt));
     try {
         switch (f) {
             case OutFormat::PDF: data = encode_pdf(pages, opt); break;
@@ -200,6 +222,7 @@ bool write_document(const std::wstring& path, OutFormat f, const std::vector<con
         return fail(ERROR_FILE_TOO_LARGE, L"The result is too large for this file type (4 GB at most).");
     }
     if (data.empty()) return fail(ERROR_NOT_ENOUGH_MEMORY, L"Creating the file failed (out of memory?).");
+    parts.next(kWriteCost);
     bool ok = write_file(path, data, error, we);
     if (win32_error) *win32_error = we.code;
     if (needed_mb) *needed_mb = we.needed_mb;

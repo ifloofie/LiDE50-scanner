@@ -31,6 +31,10 @@ Image downscale(const Image& src, int max_side);
 // the small on-screen copy and on the saved file.
 Image apply_adjustments(const Image& src, const Adjustments& a, double scale_hint = 1.0);
 
+// Rough time apply_adjustments() takes per megabyte of a scan with `channels` channels,
+// in the units of encode_cost() (writers.h). For sharing the save progress bar.
+double adjust_cost(const Adjustments& a, int channels);
+
 // Finds the bounding box of the document on a preview (non-background area).
 // Returns false if nothing distinct was found.
 bool detect_content(const Image& preview, int& x, int& y, int& w, int& h);

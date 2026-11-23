@@ -8,10 +8,13 @@
 
 #include "encoders.h"
 #include "process.h"
+#include "progress.h"
 
 #include "../third_party/miniz.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -461,6 +464,74 @@ void test_process()
     }
 }
 
+// The save progress: every encoder and the adjustments report from 0 to exactly 1 and
+// never go backwards, and creeping steps move on their own.
+void test_progress()
+{
+    struct Probe {
+        ProgressReport report;
+        double last = 0.0;
+        bool backwards = false;
+    };
+    Image col = make_image(301, 207, 3, 3, 300), bw = make_image(211, 97, 1, 2, 300);
+    SaveOptions jpeg, lossless;
+    lossless.pdf_lossless = true;
+    auto run = [&](const char* what, auto&& work) {
+        Probe p;
+        progress_bind(&p.report);
+        work();
+        progress_bind(nullptr);
+        const double f = p.report.fraction();
+        if (f < 0.999) std::printf("progress of %s ended at %.3f\n", what, f);
+        CHECK(f >= 0.999);
+    };
+    run("png", [&] { encode_png(col); });
+    run("jpeg", [&] { encode_jpeg(col, 90); });
+    run("bmp", [&] { encode_bmp(col); });
+    run("tiff", [&] { encode_tiff({&col, &bw}); });
+    run("pdf", [&] { encode_pdf({&col, &bw}, jpeg); });
+    run("pdf lossless", [&] { encode_pdf({&col, &bw}, lossless); });
+    run("docx", [&] { encode_docx({&col, &bw}, jpeg, false); });
+    Adjustments all;
+    all.denoise = 50; all.sharpness = 40; all.saturation = 20; all.invert = true; all.rotation = 90;
+    run("adjustments", [&] { apply_adjustments(col, all, 1.0); });
+
+    // nested parts land where they should
+    ProgressReport r;
+    progress_bind(&r);
+    {
+        ProgressParts outer(4.0);
+        outer.next(1.0);
+        progress(0.5);
+        CHECK(std::abs(r.fraction() - 0.125) < 1e-9);
+        outer.next(3.0);
+        {
+            ProgressParts inner(2.0);
+            inner.next(1.0);
+            progress(1.0);
+            CHECK(std::abs(r.fraction() - (0.25 + 0.75 * 0.5)) < 1e-9);
+        }
+        progress(0.1);   // lower than what's shown: the bar doesn't go back
+        CHECK(std::abs(r.fraction() - (0.25 + 0.75 * 0.5)) < 1e-9);
+    }
+    CHECK(std::abs(r.fraction() - 1.0) < 1e-9);
+    r.reset();
+    CHECK(r.fraction() == 0.0);
+    {
+        ProgressStep creeping(0.0, 1.0, 0.05);
+        const double start = r.fraction();
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(120);
+        while (std::chrono::steady_clock::now() < until) {}
+        const double later = r.fraction();
+        CHECK(later > start + 0.5 && later <= 0.95 + 1e-9);   // moved on its own, not past 95%
+    }
+    CHECK(r.fraction() >= 0.999);
+    progress_bind(nullptr);
+    // with nothing bound, reporting does nothing
+    progress(0.7);
+    CHECK(r.fraction() >= 0.999);
+}
+
 } // namespace
 
 int main()
@@ -471,6 +542,7 @@ int main()
     test_docx();
     test_jpeg_bmp();
     test_process();
+    test_progress();
     std::printf("%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }

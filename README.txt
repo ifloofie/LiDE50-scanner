@@ -1,4 +1,4 @@
-LiDE50 Scan 1.45 - portable scanning for the Canon CanoScan LiDE 50
+LiDE50 Scan 1.5 - portable scanning for the Canon CanoScan LiDE 50
 =====================================================================
 
 For 64-bit Windows 10 and 11. One file, no installer: LiDE50Scan.exe.
@@ -81,6 +81,8 @@ File types: PDF, Word (.docx), PNG, JPEG, TIFF and BMP.
 - "Save all" puts every scan into one multi-page PDF, Word or TIFF file. For
   PNG, JPEG or BMP it saves numbered files (name_001.png, name_002.png, ...).
 Use Move up / Move down to change the page order before saving.
+While a file is being saved, a progress bar shows how far it is, in the Save
+section and over the scan; the taskbar button shows it too.
 The resolution (dpi) is stored in every file, so prints come out the right size.
 
 
@@ -94,9 +96,11 @@ except the one-time WinUSB assignment.
 
 ACTIVITY LOG
 ------------
-Everything the program does is written to LiDE50Scan.log, right next to
-LiDE50Scan.exe. The file is created the first time the program starts, and
-each run is added to the end. It records:
+Everything the program does is written to LiDE50Scan-log.txt, right next
+to LiDE50Scan.exe. The file is created the first time the program starts,
+and each run is added to the end. (Up to version 1.45 it was called
+LiDE50Scan.log; 1.5 renames an old log the first time it starts.)
+It records:
   - startup details (Windows version, folders, USB status)
   - your clicks and setting changes
   - every step of each preview or scan: lamp warm-up, calibration
@@ -106,7 +110,7 @@ each run is added to the end. It records:
 Lines are written as they happen, so the log is complete even after a crash.
 A preview plus a scan adds roughly 300 KB (it used to be several MB).
 "..." > "Open the log file" shows it. When the log passes 20 MB it is renamed
-to LiDE50Scan.old.log and a new one starts.
+to LiDE50Scan-log.old.txt and a new one starts.
 If something goes wrong, start the program with "LiDE50Scan.exe --log" and
 repeat what you did. That also records every register access and every USB
 transfer, which is what's needed to track down a scanner fault (it adds a
@@ -117,6 +121,11 @@ log goes to %LOCALAPPDATA%\LiDE50Scan instead.
 
 TROUBLESHOOTING
 ---------------
+Troubleshooting.html, next to the program, is an illustrated guide to the
+common problems: open it in your browser, or use "..." > "Troubleshooting
+guide" in the app. It's also online at
+https://github.com/ifloofie/LiDE50-scanner/blob/main/TROUBLESHOOTING.md
+
 When something goes wrong, LiDE50 Scan says what happened in plain words and
 lists what to try, in order. Each message has a short code (for example
 CAL-NO-LIGHT) and a "Copy details" button that puts the message, the app and
@@ -158,8 +167,8 @@ Common cases:
 
 LICENSES
 --------
-Copyright (C) 2026 the LiDE50 Scan contributors and the authors of the
-projects below. LiDE50 Scan is free software under the GNU General Public
+Copyright (C) 2026 iFloofie and the LiDE50 Scan contributors, and the
+authors of the projects below. LiDE50 Scan is free software under the GNU General Public
 License v2 or later (see COPYING) and comes with ABSOLUTELY NO WARRANTY.
 It contains:
   - the SANE genesys backend (GL841 / LiDE 50), GPL-2.0-or-later

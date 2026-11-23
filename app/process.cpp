@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 the LiDE50 Scan contributors
 #include "process.h"
+#include "progress.h"
 
 #include <algorithm>
 #include <cmath>
@@ -31,9 +32,14 @@ Image box_blur(const Image& src, int r, int passes = 2)
     Image a = src, b = src;
     const int w = src.width, h = src.height, c = src.channels;
     const int win = 2 * r + 1;
+    // progress: each pass is a horizontal and a vertical half
+    auto report = [&](int pass, int half, int y) {
+        if ((y & 63) == 0) progress((pass * 2 + half + static_cast<double>(y) / h) / (passes * 2.0));
+    };
     for (int p = 0; p < passes; ++p) {
         // horizontal a -> b
         for (int y = 0; y < h; ++y) {
+            report(p, 0, y);
             const std::uint8_t* in = a.row(y);
             std::uint8_t* out = b.row(y);
             for (int k = 0; k < c; ++k) {
@@ -55,6 +61,7 @@ Image box_blur(const Image& src, int r, int passes = 2)
             for (size_t x = 0; x < stride; ++x) col[x] += row[x];
         }
         for (int y = 0; y < h; ++y) {
+            report(p, 1, y);
             std::uint8_t* out = a.row(y);
             for (size_t x = 0; x < stride; ++x) out[x] = static_cast<std::uint8_t>(col[x] / win);
             const std::uint8_t* add = b.row(std::min(y + r + 1, h - 1));
@@ -145,23 +152,40 @@ Image downscale(const Image& src, int max_side)
     return out;
 }
 
+double adjust_cost(const Adjustments& a, int channels)
+{
+    const bool turn = (((a.rotation % 360) + 360) % 360) != 0 || a.flip_h;
+    const bool sat = !(a.grayscale || a.black_white) && channels == 3 && a.saturation != 0;
+    return 1.0 + (a.denoise > 0 ? 6.0 : 0.0) + 1.0 + (sat ? 1.5 : 0.0) + (a.sharpness > 0 ? 3.5 : 0.0) +
+           (a.black_white ? 0.5 : 0.0) + (a.invert ? 0.5 : 0.0) + (turn ? 1.5 : 0.0);
+}
+
 Image apply_adjustments(const Image& src_in, const Adjustments& a, double scale_hint)
 {
     if (src_in.empty()) return src_in;
+    // progress while saving: rough share of the time each step takes
+    const bool turn = (((a.rotation % 360) + 360) % 360) != 0 || a.flip_h;
+    ProgressParts parts(adjust_cost(a, src_in.channels));
+    parts.next(1.0);
     Image img = (a.grayscale || a.black_white) ? to_gray(src_in) : src_in;
     const int c = img.channels;
     const size_t n = img.data.size();
 
     // 1. noise reduction / descreen
     if (a.denoise > 0) {
+        parts.next(6.0);
         int r = std::max(1, static_cast<int>(std::lround(2.0 * scale_hint)));
+        ProgressParts blur_parts(5.0);
+        blur_parts.next(4.0);
         Image blur = box_blur(img, r, 2);
+        blur_parts.next(1.0);
         double amt = a.denoise / 100.0;
         for (size_t i = 0; i < n; ++i)
             img.data[i] = clamp8(img.data[i] + (blur.data[i] - img.data[i]) * amt);
     }
 
     // 2. tone curve: levels -> gamma -> contrast -> brightness
+    parts.next(1.0);
     double lo = 0, hi = 255;
     if (a.auto_levels) {
         unsigned long long hist[256] = {};
@@ -192,6 +216,7 @@ Image apply_adjustments(const Image& src_in, const Adjustments& a, double scale_
 
     // 3. saturation
     if (c == 3 && a.saturation != 0) {
+        parts.next(1.5);
         double s = 1.0 + a.saturation / 100.0;
         for (size_t i = 0; i + 2 < n; i += 3) {
             double l = 0.299 * img.data[i] + 0.587 * img.data[i + 1] + 0.114 * img.data[i + 2];
@@ -201,8 +226,12 @@ Image apply_adjustments(const Image& src_in, const Adjustments& a, double scale_
 
     // 4. sharpen (unsharp mask)
     if (a.sharpness > 0) {
+        parts.next(3.5);
         int r = std::max(1, static_cast<int>(std::lround(1.5 * scale_hint)));
+        ProgressParts blur_parts(3.5);
+        blur_parts.next(2.5);
         Image blur = box_blur(img, r, 1);
+        blur_parts.next(1.0);
         double amt = a.sharpness / 100.0 * 1.5;
         for (size_t i = 0; i < n; ++i)
             img.data[i] = clamp8(img.data[i] + (img.data[i] - blur.data[i]) * amt);
@@ -210,6 +239,7 @@ Image apply_adjustments(const Image& src_in, const Adjustments& a, double scale_
 
     // 5. black & white
     if (a.black_white) {
+        parts.next(0.5);
         const int t = std::clamp(a.threshold, 1, 254);
         for (size_t i = 0; i < n; ++i) img.data[i] = img.data[i] >= t ? 255 : 0;
         img.bilevel = true;
@@ -218,10 +248,12 @@ Image apply_adjustments(const Image& src_in, const Adjustments& a, double scale_
     }
 
     // 6. invert
+    if (a.invert) parts.next(0.5);
     if (a.invert)
         for (size_t i = 0; i < n; ++i) img.data[i] = static_cast<std::uint8_t>(255 - img.data[i]);
 
     // 7. orientation
+    if (turn) parts.next(1.5);
     return rotate(img, a.rotation, a.flip_h);
 }
 
