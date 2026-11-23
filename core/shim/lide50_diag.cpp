@@ -16,6 +16,7 @@ extern "C" void lide50_diag_reset_scan(void)
 {
     std::memset(&g_report, 0, sizeof(g_report));
     g_report.led_dim_channel = -1;
+    g_report.led_limit_channel = -1;
     g_report.led_bright_channel = -1;
     g_report.low_light_channel = -1;
     g_error[0] = '\0';
