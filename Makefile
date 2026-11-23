@@ -26,7 +26,7 @@ build/libgenesys_lide50.a: $(CORE_OBJS)
 core: build/libgenesys_lide50.a
 .PHONY: core
 
-APP_SRCS = app/main.cpp app/scanner_engine.cpp app/problems.cpp app/process.cpp app/writers.cpp app/encoders.cpp app/sysdll.cpp app/winusb_setup.cpp app/log.cpp app/ui/gfx.cpp app/ui/ui.cpp
+APP_SRCS = app/main.cpp app/scanner_engine.cpp app/problems.cpp app/process.cpp app/writers.cpp app/encoders.cpp app/progress.cpp app/sysdll.cpp app/winusb_setup.cpp app/log.cpp app/ui/gfx.cpp app/ui/ui.cpp
 APP_OBJS = $(patsubst %.cpp,build/%.o,$(APP_SRCS)) build/third_party/miniz.o build/app/app_res.o
 APP_CXXFLAGS = $(OPT) $(HARDEN) $(DEPFLAGS) -std=c++17 -Icore/include -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -Wall -Wextra -Wno-unknown-pragmas -Wno-cast-function-type
 
@@ -53,17 +53,27 @@ dist/LiDE50Scan.exe: $(APP_OBJS) build/libgenesys_lide50.a deps/lib/libusb-1.0.a
 app: dist/LiDE50Scan.exe
 .PHONY: app
 
+# ---- troubleshooting guide: TROUBLESHOOTING.md as one themed, self-contained page for the
+# release zip (opened from the app's ⋯ menu). Needs python3 with Pillow.
+VERSION := $(shell sed -n 's/.*define LIDE50_VERSION "\([0-9.]*\)".*/\1/p' app/log.cpp)
+dist/Troubleshooting.html: TROUBLESHOOTING.md docs/troubleshooting/build_html.py $(wildcard docs/troubleshooting/img/*.png)
+	@mkdir -p dist
+	python3 docs/troubleshooting/build_html.py TROUBLESHOOTING.md $@ $(VERSION)
+
+guide: dist/Troubleshooting.html
+.PHONY: guide
+
 # ---- tests (run on the build machine, no Windows needed) ----
 # The file encoders and the image adjustments are plain C++. The test builds them with the
 # host compiler and AddressSanitizer/UBSan, writes every format and reads it back.
 # (shift-base is off because stb_image_write shifts negative numbers on purpose.)
 HOSTCXX ?= g++
 HOSTCC ?= gcc
-build/tests/run_tests: tests/test_main.cpp app/encoders.cpp app/process.cpp third_party/miniz.c app/*.h
+build/tests/run_tests: tests/test_main.cpp app/encoders.cpp app/process.cpp app/progress.cpp third_party/miniz.c app/*.h
 	@mkdir -p build/tests
 	$(HOSTCC) -O1 -g -c third_party/miniz.c -o build/tests/miniz.o
 	$(HOSTCXX) -std=c++17 -O1 -g -fsanitize=address,undefined -fno-sanitize=shift-base -fno-sanitize-recover=undefined -Iapp \
-	  -o $@ tests/test_main.cpp app/encoders.cpp app/process.cpp build/tests/miniz.o
+	  -o $@ tests/test_main.cpp app/encoders.cpp app/process.cpp app/progress.cpp build/tests/miniz.o -pthread
 
 test: build/tests/run_tests
 	build/tests/run_tests

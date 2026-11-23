@@ -18,7 +18,7 @@
 #include <vector>
 
 #ifndef LIDE50_VERSION
-#define LIDE50_VERSION "1.45.0"
+#define LIDE50_VERSION "1.5.0"
 #endif
 
 namespace {
@@ -296,7 +296,7 @@ bool open_at(const std::wstring& path)
     if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa)) {
         unsigned long long size = (static_cast<unsigned long long>(fa.nFileSizeHigh) << 32) | fa.nFileSizeLow;
         if (size > 20ull * 1024 * 1024) {
-            std::wstring old = path.substr(0, path.size() - 4) + L".old.log";
+            std::wstring old = path.substr(0, path.size() - 4) + L".old.txt";   // LiDE50Scan-log.old.txt
             MoveFileExW(path.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING);
         }
     }
@@ -344,16 +344,38 @@ std::string to_utf8(const std::wstring& w)
     return s;
 }
 
+// The log's name. Up to 1.45 it was LiDE50Scan.log, which Windows shows as just
+// "LiDE50Scan" (a text document) next to "LiDE50Scan" the program, since file
+// extensions are hidden by default. The new name says what it is.
+static const wchar_t kLogName[] = L"LiDE50Scan-log.txt";
+
+// Gives a log from an earlier version the new name, so its history isn't lost.
+static void adopt_old_log(const std::wstring& dir)
+{
+    const struct { const wchar_t* from; const wchar_t* to; } renames[] = {
+        {L"\\LiDE50Scan.log", L"\\LiDE50Scan-log.txt"},
+        {L"\\LiDE50Scan.old.log", L"\\LiDE50Scan-log.old.txt"},
+    };
+    for (const auto& r : renames) {
+        const std::wstring from = dir + r.from, to = dir + r.to;
+        if (GetFileAttributesW(from.c_str()) != INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesW(to.c_str()) == INVALID_FILE_ATTRIBUTES)
+            MoveFileExW(from.c_str(), to.c_str(), 0);
+    }
+}
+
 std::wstring log_open(const std::wstring& exe_dir, const std::wstring& fallback_dir)
 {
     if (!g_lock_ready) {
         InitializeCriticalSection(&g_lock);
         g_lock_ready = true;
     }
-    bool ok = open_at(exe_dir + L"\\LiDE50Scan.log");
+    adopt_old_log(exe_dir);
+    bool ok = open_at(exe_dir + L"\\" + kLogName);
     if (!ok) {
         CreateDirectoryW(fallback_dir.c_str(), nullptr);
-        ok = open_at(fallback_dir + L"\\LiDE50Scan.log");
+        adopt_old_log(fallback_dir);
+        ok = open_at(fallback_dir + L"\\" + kLogName);
     }
     if (ok) {
         emit("INFO", "");

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 the LiDE50 Scan contributors
 #include "encoders.h"
+#include "progress.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -52,10 +53,29 @@ Bytes zlib_compress(const unsigned char* data, size_t len, int level = 6)
     const unsigned long long bound64 = 128ull + len + len / 10 + (len / (31 * 1024) + 1) * 5;
     if (bound64 > 0xFFFFFFFFull) throw EncodeTooLarge{};
     Bytes out(static_cast<size_t>(bound64));
-    mz_ulong out_len = static_cast<mz_ulong>(bound64);
-    if (mz_compress2(out.data(), &out_len, data, static_cast<mz_ulong>(len), level) != MZ_OK)
-        throw std::bad_alloc();
-    out.resize(out_len);
+    // fed in 1 MB pieces so the progress bar can follow along
+    mz_stream z{};
+    if (mz_deflateInit(&z, level) != MZ_OK) throw std::bad_alloc();
+    struct End {
+        mz_stream* z;
+        ~End() { mz_deflateEnd(z); }
+    } end{&z};
+    z.next_out = out.data();
+    z.avail_out = static_cast<unsigned int>(bound64);
+    const size_t piece = 1u << 20;
+    size_t fed = 0;
+    for (;;) {
+        const size_t n = std::min(piece, len - fed);
+        z.next_in = data + fed;
+        z.avail_in = static_cast<unsigned int>(n);
+        fed += n;
+        const bool last = fed == len;
+        const int r = mz_deflate(&z, last ? MZ_FINISH : MZ_NO_FLUSH);
+        if (last ? r != MZ_STREAM_END : (r != MZ_OK || z.avail_in != 0)) throw std::bad_alloc();
+        if (len) progress(static_cast<double>(fed) / static_cast<double>(len));
+        if (last) break;
+    }
+    out.resize(static_cast<size_t>(z.total_out));
     return out;
 }
 
@@ -89,6 +109,9 @@ void png_chunk(Bytes& out, const char* type, const Bytes& data)
 
 std::vector<unsigned char> encode_png(const Image& img)
 {
+    // filtering takes about a third of the time, compressing the rest
+    ProgressParts parts(3.0);
+    parts.next(1.0);
     Bytes raw;
     int bit_depth = 8, color_type = img.channels == 3 ? 2 : 0;
     if (img.bilevel && img.channels == 1) {
@@ -138,6 +161,7 @@ std::vector<unsigned char> encode_png(const Image& img)
             }
             raw.push_back(static_cast<unsigned char>(best));
             raw.insert(raw.end(), cand[best].begin(), cand[best].end());
+            if ((y & 63) == 0) progress(static_cast<double>(y) / img.height);
         }
     }
 
@@ -155,7 +179,9 @@ std::vector<unsigned char> encode_png(const Image& img)
         put_be32(phys, ppm); put_be32(phys, ppm); phys.push_back(1);
         png_chunk(out, "pHYs", phys);
     }
+    parts.next(2.0);
     Bytes idat = zlib_compress(raw.data(), raw.size(), 6);
+    parts.finish();
     if (idat.size() > 0x7FFFFFFFull) throw EncodeTooLarge{};   // PNG chunk length limit
     png_chunk(out, "IDAT", idat);
     png_chunk(out, "IEND", {});
@@ -175,6 +201,8 @@ void stb_to_vector(void* ctx, void* data, int size)
 
 std::vector<unsigned char> encode_jpeg(const Image& img, int quality)
 {
+    // the library reports no progress: let the bar creep at about 60 MB a second
+    ProgressStep step(0.0, 1.0, static_cast<double>(img.data.size()) / 60e6);
     Bytes out;
     if (!stbi_write_jpg_to_func(stb_to_vector, &out, img.width, img.height, img.channels, img.data.data(),
                                 std::clamp(quality, 10, 100)) || out.empty())
@@ -192,6 +220,7 @@ std::vector<unsigned char> encode_jpeg(const Image& img, int quality)
 
 std::vector<unsigned char> encode_bmp(const Image& img)
 {
+    ProgressStep step(0.0, 1.0, static_cast<double>(img.data.size()) / 300e6);
     Bytes out;
     if (!stbi_write_bmp_to_func(stb_to_vector, &out, img.width, img.height, img.channels, img.data.data()) ||
         out.empty())
@@ -291,8 +320,12 @@ std::vector<unsigned char> encode_tiff(const std::vector<const Image*>& pages)
     Bytes out = {'I', 'I', 42, 0, 0, 0, 0, 0};
     size_t next_ifd_ptr = 4;
     LzwEncoder lzw;
+    double total_bytes = 0;
+    for (const Image* pg : pages) total_bytes += static_cast<double>(pg->data.size());
+    ProgressParts parts(total_bytes);
     for (size_t p = 0; p < pages.size(); ++p) {
         const Image& img = *pages[p];
+        parts.next(static_cast<double>(img.data.size()));
         const bool bilevel = img.bilevel && img.channels == 1;
         const size_t row_bytes = bilevel ? (static_cast<size_t>(img.width) + 7) / 8 : img.stride();
         Bytes packed;
@@ -321,6 +354,7 @@ std::vector<unsigned char> encode_tiff(const std::vector<const Image*>& pages)
             out.insert(out.end(), enc.begin(), enc.end());
             // classic TIFF uses 32-bit offsets: the whole file (all pages) must stay under 4 GB
             if (out.size() > 0xFFF00000ull) throw EncodeTooLarge{};
+            progress(static_cast<double>(s + 1) / strips);
         }
         auto put_array = [&](const std::vector<std::uint32_t>& v) -> std::uint32_t {
             if (v.size() == 1) return v[0];
@@ -394,8 +428,12 @@ std::vector<unsigned char> encode_pdf(const std::vector<const Image*>& pages, co
     append(out, "<< /Type /Pages /Count " + std::to_string(pages.size()) + " /Kids [ " + kids + "] >>\nendobj\n");
 
     char buf[256];
+    double total_bytes = 0;
+    for (const Image* pg : pages) total_bytes += static_cast<double>(pg->data.size());
+    ProgressParts parts(total_bytes);
     for (size_t i = 0; i < pages.size(); ++i) {
         const Image& img = *pages[i];
+        parts.next(static_cast<double>(img.data.size()));
         const size_t page_id = 3 + i * 3, content_id = page_id + 1, image_id = page_id + 2;
         const double dpi = img.dpi > 0 ? img.dpi : 300.0;
         const double pw = img.width * 72.0 / dpi, ph = img.height * 72.0 / dpi;
@@ -470,8 +508,12 @@ std::vector<unsigned char> encode_docx(const std::vector<const Image*>& pages, c
 
     std::string rels, body;
     std::vector<std::pair<std::string, Bytes>> media;
+    double total_bytes = 0;
+    for (const Image* pg : pages) total_bytes += static_cast<double>(pg->data.size());
+    ProgressParts parts(total_bytes * 1.05);   // the last 5%: building the archive
     for (size_t i = 0; i < pages.size(); ++i) {
         const Image& img = *pages[i];
+        parts.next(static_cast<double>(img.data.size()));
         bool png = img.bilevel && img.channels == 1;
         Bytes data = png ? encode_png(img) : encode_jpeg(img, opt.jpeg_quality);
         std::string name = "image" + std::to_string(i + 1) + (png ? ".png" : ".jpeg");
@@ -545,8 +587,11 @@ std::vector<unsigned char> encode_docx(const std::vector<const Image*>& pages, c
     add("docProps/app.xml", app_xml);
     add("word/_rels/document.xml.rels", doc_rels);
     add("word/document.xml", document);
+    parts.next(total_bytes * 0.05);
+    // the pictures are JPEG or PNG, already compressed: stored as they are, which is much
+    // faster than compressing them a second time for almost no gain
     for (auto& m : media) {
-        if (!mz_zip_writer_add_mem(&zip, m.first.c_str(), m.second.data(), m.second.size(), MZ_BEST_SPEED))
+        if (!mz_zip_writer_add_mem(&zip, m.first.c_str(), m.second.data(), m.second.size(), MZ_NO_COMPRESSION))
             throw std::bad_alloc();
         Bytes().swap(m.second);   // the archive has its own copy now
     }

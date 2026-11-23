@@ -15,6 +15,10 @@ const wchar_t* format_extension(OutFormat f);          // e.g. L"pdf"
 const wchar_t* format_filter(OutFormat f);             // file dialog filter (double-NUL terminated)
 bool format_multipage(OutFormat f);                    // PDF, DOCX, TIFF hold several pages
 
+// Rough time to encode and write one megabyte of image in this format, in the same units
+// as adjust_cost() (process.h). Used to share the save progress bar between the steps.
+double encode_cost(OutFormat f, const SaveOptions& opt);
+
 // Writes all pages into one file (multi-page formats) or the first page.
 // The file is written under a temporary name first and only replaces an existing file
 // once it is complete, so a failed save never damages the old file.

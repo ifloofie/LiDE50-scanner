@@ -36,10 +36,12 @@ On first use, the app asks Windows once for permission and assigns Windows' own 
 - Fully portable: settings and calibration are stored next to the exe.
 - Problems are explained in plain language with numbered steps to fix them, a
   one-click fix where there is one, and "Copy details" for bug reports.
-- An activity log (`LiDE50Scan.log`) next to the exe, with crash reports.
+- An activity log (`LiDE50Scan-log.txt`) next to the exe, with crash reports.
   Run `LiDE50Scan.exe --log` for a full USB trace.
 
-The full user guide is in [README.txt](README.txt).
+The full user guide is in [README.txt](README.txt). If something goes wrong, the
+**[troubleshooting guide](TROUBLESHOOTING.md)** shows each common problem with pictures. It's also in the
+download as `Troubleshooting.html` and opens from the app's **⋯ → Troubleshooting guide**.
 
 ## Download
 
@@ -91,7 +93,8 @@ build, use `git clone --recursive`, or use the complete source archive
 | `core/genesys/` | SANE 1.2.1 genesys backend, reduced to the GL841 / Canon LiDE 50. Five files differ from SANE 1.2.1 (`genesys.cpp`, `low.cpp`, `tables_model.cpp`, `device.h`, `error.h`); each lists its changes with dates in its header. The other chips' `.cpp` files are left out. |
 | `core/shim/` | Windows replacements for SANE's USB, configuration and debug helpers (libusb/WinUSB) |
 | `third_party/libusb/` | libusb 1.0.30 (submodule linked to the official repository) |
-| `tests/` | Tests for the file writers and image adjustments (`make test`, runs on the build machine) |
+| `tests/` | Tests for the file writers, image adjustments and save progress (`make test`, runs on the build machine) |
+| `docs/troubleshooting/` | Pictures for [TROUBLESHOOTING.md](TROUBLESHOOTING.md); `art.py` draws the illustrations, `build_html.py` makes `Troubleshooting.html` (`make guide`) |
 | `third_party/` | miniz and stb_image_write |
 
 ## Credits

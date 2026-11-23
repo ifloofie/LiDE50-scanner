@@ -478,7 +478,7 @@ Problem problem_save(unsigned long e, const std::wstring& path, double needed_mb
                        L"If the folder is on a USB stick or SD card, check that it isn't write-protected.",
                        L"If a file with this name already exists and is read-only, choose a different name."};
             p.fix = FixAction::OpenRansomwareSettings;
-            p.fix_label = L"Open ransomware protection";
+            p.fix_label = L"Ransomware settings";
             return p;
         case ERROR_SHARING_VIOLATION:
         case ERROR_LOCK_VIOLATION:
@@ -642,6 +642,7 @@ Problem help_not_found()
     p.title = L"Help: the scanner isn't found";
     p.steps.push_back(L"If the sidebar says \"Needs permission\", click Enable scanner access once.");
     p.steps.push_back(L"If you used Canon's own driver before, the one-time setup switches the scanner over.");
+    p.steps.push_back(L"The Troubleshooting guide in the ⋯ menu shows each of these steps with pictures.");
     return p;
 }
 
@@ -657,6 +658,7 @@ Problem help_colours()
                L"Scan again. LiDE50 Scan checks every calibration and warns when a colour didn't settle.",
                L"If one colour is weak every time, that LED is probably wearing out. Grayscale scans are less "
                L"affected."};
+    p.steps.push_back(L"The Troubleshooting guide in the ⋯ menu shows each of these steps with pictures.");
     return p;
 }
 
@@ -674,6 +676,7 @@ Problem help_noise_stretched()
                L"when saving.",
                L"If it happens at every resolution, use Copy details and include which resolution you used "
                L"when you report the problem."};
+    p.steps.push_back(L"The Troubleshooting guide in the ⋯ menu shows each of these steps with pictures.");
     return p;
 }
 
@@ -682,10 +685,11 @@ Problem help_crashes()
     Problem p;
     p.code = "HELP-CRASH";
     p.title = L"Help: the app closes or crashes";
-    p.what = L"Every crash is written to LiDE50Scan.log next to the app, with the details needed to fix it.";
+    p.what = L"Every crash is written to LiDE50Scan-log.txt next to the app, with the details needed to fix it.";
     p.steps = {L"Restart LiDE50 Scan. It shows what happened last time.",
                L"Use Copy details (or open the log from the ⋯ menu) and include the text when you report the "
                L"problem.",
                L"Very large scans need a lot of memory: select a smaller area or use a lower resolution."};
+    p.steps.push_back(L"The Troubleshooting guide in the ⋯ menu shows each of these steps with pictures.");
     return p;
 }

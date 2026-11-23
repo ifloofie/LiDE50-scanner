@@ -20,6 +20,7 @@
 #include <dbt.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <initguid.h>
 #include <usbiodef.h>
 
@@ -38,6 +39,7 @@
 #include "log.h"
 #include "problems.h"
 #include "process.h"
+#include "progress.h"
 #include "scanner_engine.h"
 #include "sysdll.h"
 #include "ui/gfx.h"
@@ -133,6 +135,12 @@ std::wstring g_scanner_detail = L"Looking for the scanner";
 std::wstring g_status;
 bool g_setup_running = false;
 std::atomic<bool> g_saving{false};
+// progress of the save that is running (or that ran last), for the bars and the taskbar
+ProgressReport g_save_progress;
+std::atomic<int> g_save_file{0};   // file being written, from 1, when each scan is its own file
+int g_save_files = 0;              // files the save writes
+int g_save_scans = 0;              // scans it holds
+bool g_save_failed = false;
 Problem g_scanner_problem;          // why the scanner can't be used right now (sidebar card)
 ScanRequest g_last_request;         // for "Try again"
 bool g_have_last_request = false;
@@ -208,6 +216,8 @@ std::wstring exe_path()
     GetModuleFileNameW(nullptr, p, MAX_PATH * 4);
     return p;
 }
+
+const wchar_t kGuideUrl[] = L"https://github.com/ifloofie/LiDE50-scanner/blob/main/TROUBLESHOOTING.md";
 
 std::wstring exe_dir()
 {
@@ -511,16 +521,36 @@ void set_scanner_state(ScannerUi s, const std::wstring& detail)
     redraw();
 }
 
+// Test hook, only with --fake-usb: LIDE50_TEST_USB=none|needs-setup|other-driver|disabled|error
+// pretends Windows reports the scanner that way, to see (and photograph for the
+// troubleshooting guide) the messages for states a test machine can't produce.
+bool test_usb_state(UsbAccessInfo& info)
+{
+    const char* t = g_fake_usb ? std::getenv("LIDE50_TEST_USB") : nullptr;
+    if (!t || !*t) return false;
+    const std::string v = t;
+    info = UsbAccessInfo();
+    info.instance_id = L"USB\\VID_04A9&PID_2213\\TEST";
+    if (v == "needs-setup") info.state = UsbAccessState::NeedsSetup;
+    else if (v == "other-driver") { info.state = UsbAccessState::NeedsSetup; info.service = L"usbscan"; }
+    else if (v == "disabled") { info.state = UsbAccessState::NeedsSetup; info.service = L"WinUSB"; info.problem = 22; }
+    else if (v == "error") { info.state = UsbAccessState::NeedsSetup; info.service = L"WinUSB"; info.problem = 43; }
+    else info.state = UsbAccessState::NotConnected;
+    return true;
+}
+
 void check_scanner()
 {
-    if (g_simulate || g_fake_usb) {
+    UsbAccessInfo info;
+    const bool test_state = test_usb_state(info);
+    if ((g_simulate || g_fake_usb) && !test_state) {
         if (!g_engine.connected() && !g_engine.busy()) {
             set_scanner_state(ScannerUi::Connecting, L"Connecting");
             g_engine.connect();
         }
         return;
     }
-    UsbAccessInfo info = usb_detect_lide50();
+    if (!test_state) info = usb_detect_lide50();
     UsbAccessState prev = g_usb_state;
     g_usb_state = info.state;
     if (prev != info.state || info.state != UsbAccessState::Ready) {
@@ -823,12 +853,32 @@ void launch_save(std::vector<std::shared_ptr<Page>> pages, OutFormat f, const st
         }
     }
 
+    // share of the progress bar for each step: adjusting a scan, then encoding and writing
+    // the file, each by its size and by how long that kind of work takes
+    struct Share { double adjust, write; };
+    std::vector<Share> shares;
+    for (auto& j : jobs) {
+        const double mb = static_cast<double>(j.page->raw.data.size()) / 1048576.0;
+        const int out_channels = (j.adj.grayscale || j.adj.black_white) ? 1 : j.page->raw.channels;
+        const double out_mb = mb * out_channels / std::max(1, j.page->raw.channels);
+        shares.push_back({mb * adjust_cost(j.adj, j.page->raw.channels), out_mb * encode_cost(f, opt)});
+    }
+
+    g_save_progress.reset();
+    g_save_file = 1;
+    g_save_files = static_cast<int>(targets.size());
+    g_save_scans = static_cast<int>(jobs.size());
+    g_save_failed = false;
     g_saving = true;
     g_ui.close_popover();
     set_status(L"Saving");
     logw("UI", L"saving " + std::to_wstring(jobs.size()) + L" scan(s) as " + format_extension(f) + L" to " + path);
-    std::thread([jobs, targets, f, path, opt]() {
+    std::thread([jobs, targets, f, path, opt, shares]() {
         prepare_thread_for_crash_logging("save");
+        progress_bind(&g_save_progress);
+        double total = 0;
+        for (auto& s : shares) total += s.adjust + s.write;
+        ProgressParts parts(total);
         auto* result = new TaskResult();
         std::wstring err;
         unsigned long code = 0;
@@ -841,15 +891,24 @@ void launch_save(std::vector<std::shared_ptr<Page>> pages, OutFormat f, const st
             if (targets.size() == 1) {
                 std::vector<Image> processed;
                 processed.reserve(jobs.size());
-                for (auto& j : jobs) processed.push_back(apply_adjustments(j.page->raw, j.adj, 1.0));
+                double writing = 0;
+                for (size_t i = 0; i < jobs.size(); ++i) {
+                    parts.next(shares[i].adjust);
+                    processed.push_back(apply_adjustments(jobs[i].page->raw, jobs[i].adj, 1.0));
+                    writing += shares[i].write;
+                }
                 std::vector<const Image*> ptrs;
                 for (auto& p : processed) ptrs.push_back(&p);
+                parts.next(writing);
                 ok = write_document(path, f, ptrs, opt, err, &code, &needed, &free_mb);
                 count = ok ? processed.size() : 0;
             } else {
                 for (size_t i = 0; i < jobs.size() && ok; ++i) {
+                    g_save_file = static_cast<int>(i + 1);
+                    parts.next(shares[i].adjust);
                     Image one = apply_adjustments(jobs[i].page->raw, jobs[i].adj, 1.0);  // one at a time
                     failed_path = targets[i];
+                    parts.next(shares[i].write);
                     ok = write_document(targets[i], f, {&one}, opt, err, &code, &needed, &free_mb);
                     if (ok) ++count;
                 }
@@ -872,6 +931,8 @@ void launch_save(std::vector<std::shared_ptr<Page>> pages, OutFormat f, const st
         if (!ok && count > 0 && targets.size() > 1)
             result->problem.what += L" The first " + std::to_wstring(count) + L" file(s) were saved.";
         result->ok = ok;
+        if (ok) parts.finish();
+        progress_bind(nullptr);
         if (targets.size() == 1) result->message = L"Saved " + file_name_of(path);
         else result->message = L"Saved " + std::to_wstring(targets.size()) + L" files: " + file_name_of(targets.front()) +
                                L" to " + file_name_of(targets.back());
@@ -1045,17 +1106,36 @@ void set_theme(bool dark)
 
 void show_about()
 {
-    g_ui.alert(L"LiDE50 Scan 1.45",
+    g_ui.alert(L"LiDE50 Scan 1.5",
                L"Portable scanning for the Canon CanoScan LiDE 50 on 64-bit Windows. The scanner driver is built "
                L"in and talks to the scanner through Windows' own WinUSB driver, so nothing else needs installing.\n\n"
+               L"Developed by iFloofie: github.com/ifloofie/LiDE50-scanner\n\n"
                L"Built on the SANE genesys backend (GPL-2.0-or-later), libusb (LGPL-2.1), miniz (MIT) and "
                L"stb_image_write (public domain).\n\n"
-               L"Copyright (C) 2026 the LiDE50 Scan contributors and the authors of the projects above. "
+               L"Copyright (C) 2026 iFloofie and the LiDE50 Scan contributors, and the authors of the projects above. "
                L"LiDE50 Scan is free software under the GNU General Public License, version 2 or later: you "
                L"may share and change it under that licence. It comes with ABSOLUTELY NO WARRANTY. See the "
                L"COPYING file for details.\n\n"
                L"Canon and CanoScan are trademarks of Canon Inc.; this app is not affiliated with Canon.",
                {L"OK"}, nullptr);
+}
+
+// The troubleshooting guide: Troubleshooting.html from the download, next to the exe, or
+// the same guide on GitHub when only the exe was copied somewhere.
+void open_guide()
+{
+    const std::wstring local = exe_dir() + L"\\Troubleshooting.html";
+    const bool here = GetFileAttributesW(local.c_str()) != INVALID_FILE_ATTRIBUTES;
+    const std::wstring target = here ? local : std::wstring(kGuideUrl);
+    LOG_UI("opening the troubleshooting guide (%s)", here ? "next to the app" : "on GitHub");
+    auto r = reinterpret_cast<INT_PTR>(ShellExecuteW(g_main, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+    if (r <= 32) {
+        LOG_WARN("could not open the troubleshooting guide (ShellExecute %lld)", static_cast<long long>(r));
+        g_ui.alert(L"Troubleshooting guide",
+                   L"The guide couldn't be opened here. It's also on the web:\n" + std::wstring(kGuideUrl) +
+                       L"\n\nThe ⋯ menu's Help items cover the most common problems too.",
+                   {L"OK"}, nullptr);
+    }
 }
 
 void open_more_menu(const RectF& anchor)
@@ -1097,6 +1177,7 @@ void open_more_menu(const RectF& anchor)
     m.push_back({L"Manual setup steps", Icon::Doc, true, true,
                  [] { g_ui.alert(L"Manual setup", usb_manual_setup_instructions(), {L"OK"}, nullptr); }});
     m.push_back({L"", Icon::Check, false, false, nullptr, true});
+    m.push_back({L"Troubleshooting guide", Icon::Doc, true, true, [] { open_guide(); }});
     m.push_back({L"Help: scanner not found", Icon::Wand, true, true, [] { show_problem(help_not_found()); }});
     m.push_back({L"Help: colours look wrong", Icon::Wand, true, true, [] { show_problem(help_colours()); }});
     m.push_back({L"Help: noise or stretched scans", Icon::Wand, true, true,
@@ -1624,6 +1705,112 @@ void draw_canvas(const RectF& area)
 float g_y;          // layout cursor
 float g_x0, g_w;    // content column
 
+// ------------------------------------------------------------- saving progress
+
+// Read once per frame, so the bars in the sidebar and over the canvas always agree.
+float g_save_frac_shown = 0.0f;
+int g_save_file_shown = 1;
+
+void update_save_shown()
+{
+    g_save_frac_shown = ui.anim("save.frac", static_cast<float>(g_save_progress.fraction()), 10.0f);
+    g_save_file_shown = g_save_file.load();
+}
+
+// What the save is doing, for the bars: "Saving 47%", "Saving file 2 of 3 · 47%",
+// "Saving 3 scans · 47%".
+std::wstring save_label(int pct, bool with_pct = true)
+{
+    std::wstring s = L"Saving";
+    if (g_save_files > 1)
+        s += L" file " + std::to_wstring(std::clamp(g_save_file_shown, 1, g_save_files)) + L" of " +
+             std::to_wstring(g_save_files);
+    else if (g_save_scans > 1)
+        s += L" " + std::to_wstring(g_save_scans) + L" scans";
+    if (with_pct) s += (g_save_files > 1 || g_save_scans > 1 ? L" \u00B7 " : L" ") + std::to_wstring(pct) + L"%";
+    return s;
+}
+
+// A filled pill like the scan progress in the toolbar.
+void draw_progress_pill(const RectF& pc, float frac, const std::wstring& label, bool failed)
+{
+    const float rad = pc.h * 0.5f;
+    gx.fill_rrect(pc, rad, ui.t.track);
+    if (frac > 0.005f) {
+        RectF fill{pc.x, pc.y, std::max(pc.h, pc.w * frac), pc.h};
+        if (failed) gx.fill_rrect(fill, rad, ui.t.danger);
+        else gx.fill_rrect_hgrad(fill, rad, ui.t.accent, ui.t.accent2);
+        gx.fill_rrect_vgrad(RectF{fill.x, fill.y, fill.w, fill.h * 0.55f}, rad, Color::hex(0xFFFFFF, 0.35f),
+                            Color::hex(0xFFFFFF, 0.0f));
+    }
+    if (!failed) {
+        float sx = pc.x + std::fmod(static_cast<float>(ui.time) * 160.0f, pc.w + 120.0f) - 60.0f;
+        gx.fill_rrect_radial(pc, rad, sx, pc.cy(), 70.0f, Color::hex(0xFFFFFF, 0.28f), Color::hex(0xFFFFFF, 0.0f));
+    }
+    gx.stroke_rrect_vgrad(pc.inset(0.6f), rad, ui.t.rim_top, ui.t.rim_bottom, 1.0f);
+    if (!label.empty()) {
+        Color lc = frac > 0.5f ? ui.t.on_accent : ui.t.text;
+        gx.text(label, pc, 13.0f, 600, lc, Align::Center, Align::Center);
+    }
+}
+
+// The floating "Saving" capsule over the bottom of the canvas, where the "Saved" message
+// appears afterwards. It's there whatever part of the sidebar is in view.
+void draw_save_hud(const RectF& canvas)
+{
+    // goes quickly once done: the "Saved" message takes its place
+    float a = ui.anim("save.hud", g_saving ? 1.0f : 0.0f, g_saving ? 10.0f : 14.0f);
+    if (a < 0.01f) return;
+    ui.request_frame();
+    const float frac = (g_saving || g_save_failed) ? g_save_frac_shown : 1.0f;
+    const int pct = static_cast<int>(frac * 100.0f + 0.5f);
+    const float w = std::min(360.0f, canvas.w - 40.0f), h = 58.0f;
+    RectF r{canvas.cx() - w * 0.5f, gx.height() - 116.0f - h + 14.0f * (1.0f - a), w, h};
+    gx.push_opacity(a * a);
+    ui.glass_overlay(r, 20.0f, 1.2f);
+    RectF ic{r.x + 16.0f, r.y + 13.0f, 20.0f, 20.0f};
+    gx.icon(Icon::Save, ic, g_save_failed ? ui.t.danger : ui.t.accent, 1.8f);
+    std::wstring label = g_saving ? save_label(pct, false) : g_save_failed ? std::wstring(L"Not saved")
+                                                                           : std::wstring(L"Saved");
+    gx.text(label, RectF{ic.r() + 10.0f, r.y + 10.0f, w - 120.0f, 26.0f}, 13.5f, 600, ui.t.text, Align::Start,
+            Align::Center);
+    gx.text(std::to_wstring(pct) + L"%", RectF{r.r() - 76.0f, r.y + 10.0f, 60.0f, 26.0f}, 13.5f, 700,
+            g_save_failed ? ui.t.danger : ui.t.accent, Align::End, Align::Center);
+    draw_progress_pill(RectF{r.x + 16.0f, r.y + 40.0f, w - 32.0f, 8.0f}, frac, L"", g_save_failed);
+    gx.pop_opacity();
+}
+
+// The progress on the app's taskbar button, so it shows while the window is minimized.
+ITaskbarList3* g_taskbar = nullptr;
+bool g_taskbar_tried = false;
+int g_taskbar_shown = -2;   // last value sent: -1 off, 0..1000 progress, 1001 error
+
+void taskbar_progress(int value)
+{
+    if (value == g_taskbar_shown) return;
+    if (!g_taskbar && !g_taskbar_tried) {
+        g_taskbar_tried = true;
+        if (FAILED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER, IID_ITaskbarList3,
+                                    reinterpret_cast<void**>(&g_taskbar))) ||
+            !g_taskbar || FAILED(g_taskbar->HrInit())) {
+            if (g_taskbar) g_taskbar->Release();
+            g_taskbar = nullptr;
+            LOG_INFO("taskbar progress isn't available");
+        }
+    }
+    g_taskbar_shown = value;
+    if (!g_taskbar || !g_main) return;
+    if (value < 0) {
+        g_taskbar->SetProgressState(g_main, TBPF_NOPROGRESS);
+    } else if (value > 1000) {
+        g_taskbar->SetProgressState(g_main, TBPF_ERROR);
+        g_taskbar->SetProgressValue(g_main, 1000, 1000);
+    } else {
+        g_taskbar->SetProgressState(g_main, TBPF_NORMAL);
+        g_taskbar->SetProgressValue(g_main, static_cast<ULONGLONG>(value), 1000);
+    }
+}
+
 void section_title(const std::wstring& title, const std::wstring& right = L"")
 {
     g_y += 10.0f;
@@ -1919,6 +2106,14 @@ void draw_sidebar(const RectF& panel)
         }
         bool can = !g_pages.empty() && !g_saving;
         float bw = (g_w - 10.0f) * 0.5f;
+        if (g_saving) {
+            // while saving, the two buttons make way for the progress
+            const float frac = g_save_frac_shown;
+            draw_progress_pill(RectF{g_x0, g_y, g_w, 40.0f}, frac,
+                               save_label(static_cast<int>(frac * 100.0f + 0.5f)), false);
+            ui.request_frame();
+            g_y += 52.0f;
+        } else {
         if (ui.button("savepage", RectF{g_x0, g_y, bw, 40.0f}, L"Save scan", Icon::Save, true, ButtonStyle::Primary, can,
                       L"Ctrl+S"))
             ui.defer([] { save_pages(false); });
@@ -1927,6 +2122,7 @@ void draw_sidebar(const RectF& panel)
                       can, L"Ctrl+Shift+S"))
             ui.defer([] { save_pages(true); });
         g_y += 52.0f;
+        }
     }
 
     g_side_content = g_y - y_start + 16.0f;
@@ -2203,10 +2399,14 @@ void render_frame()
     RectF canvas{center.x, center.y + 64.0f, center.w, center.h - 64.0f};
     ui.toast_cx = canvas.cx();
 
+    update_save_shown();
     draw_canvas(canvas);
     draw_sidebar(side);
     draw_scans(scans);
     draw_toolbar(center);
+    draw_save_hud(canvas);
+    if (g_saving) taskbar_progress(static_cast<int>(g_save_progress.fraction() * 1000.0));
+    else if (g_taskbar_shown == 1001 && !ui.modal_open()) taskbar_progress(-1);   // the error was read
 
     ui.end_frame();
 }
@@ -2434,7 +2634,9 @@ LRESULT main_proc_impl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case WM_SAVE_DONE: {
             std::unique_ptr<TaskResult> r(reinterpret_cast<TaskResult*>(lp));
             g_saving = false;
+            g_save_failed = !r->ok;
             g_status.clear();
+            taskbar_progress(r->ok ? -1 : 1001);
             if (r->ok) ui.toast(r->message, 1);
             else show_problem(r->problem, [] { save_pages(g_last_save_all); });
             redraw();

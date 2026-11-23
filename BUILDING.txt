@@ -7,7 +7,8 @@ Building LiDE50 Scan (cross-compiled on Ubuntu 24.04 with MinGW-w64)
     ./configure --host=x86_64-w64-mingw32 --enable-static --disable-shared --prefix=$PWD/../../deps && \
     make && make install && cd ../..
   make core app          # -> dist/LiDE50Scan.exe (and build/LiDE50Scan.full.exe with symbols)
-  make test              # file writers and image adjustments, on the build machine (g++, ASan/UBSan)
+  make test              # file writers, image adjustments and save progress (g++, ASan/UBSan)
+  make guide             # -> dist/Troubleshooting.html from TROUBLESHOOTING.md (python3 + Pillow)
   make clean             # removes build/ and dist/
 
 Every object file records the headers it used (-MMD), so changing a header rebuilds
@@ -24,6 +25,11 @@ Layout
                  one-time WinUSB binding. sysdll.cpp loads d2d1, dwrite, dwmapi and newdev
                  from System32 at run time, so they are not on the link line.
   tests/         "make test"
+  docs/troubleshooting/
+                 pictures for TROUBLESHOOTING.md. img/app-*.png are screenshots of the
+                 app under Wine (--fake-usb with the LIDE50_FAKE_* and LIDE50_TEST_USB
+                 settings below); the others are drawn by art.py (python3 art.py <dir>
+                 samples/, then rsvg-convert -z 1.5, then pngquant).
   third_party    miniz 3.0.2 (MIT), stb_image_write v1.16 (public domain),
                  libusb/ = submodule of github.com/libusb/libusb at v1.0.30 (LGPL)
 
@@ -43,5 +49,7 @@ real one. Test settings (environment variables):
   LIDE50_FAKE_FAIL_AT=<n>       the n-th bulk read fails (USB error)
   LIDE50_FAKE_AWAY=<n>          head reports "away from home" for n status reads
   LIDE50_TEST_PARK_MS=<ms>      imitate the head-return time
+  LIDE50_TEST_USB=<state>       with --fake-usb: pretend Windows reports the scanner as
+                                none, needs-setup, other-driver, disabled or error
   LIDE50_CRASH_TEST=1           crash on purpose (tests the crash report; only with
                                 --simulate or --fake-usb)
